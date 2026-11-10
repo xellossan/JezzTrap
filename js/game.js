@@ -1,0 +1,1976 @@
+// EntrapBall VR — First-Person 3D VR & Desktop Arena Game Engine (Moraff's Entrap + JezzBall)
+class EntrapBallGame {
+  constructor() {
+    this.cfg = window.GAME_CONFIG;
+
+    // Mode & Session State
+    this.displayMode = 'desktop'; // 'desktop' | 'vr'
+    this.networkMode = 'single';  // 'single' | 'host' | 'client'
+    this.roomName = this.cfg.DEFAULT_ROOM_NAME;
+    this.xrSession = null;
+    this.xrSupported = false;
+
+    // User-Configurable Pre-Game Settings (Balls & Lives)
+    this.configuredBalls = this.cfg.DEFAULT_BALL_COUNT;
+    this.configuredLives = this.cfg.DEFAULT_LIVES;
+
+    // Game State
+    this.state = 'lobby'; // 'lobby' | 'playing' | 'paused' | 'levelclear' | 'gameover'
+    this.level = 1;
+    this.score = 0;
+    this.lives = this.configuredLives;
+    this.capturedPct = 0;
+    this.buildRange = this.cfg.BUILD_RANGE_CELLS;
+    this.coopBotEnabled = false;
+
+    // Timers
+    this.buildCooldownTimer = 0;
+    this.deleteCooldownTimer = 0;
+    this.invulnTimer = 0;
+    this.netSyncTimer = 0;
+
+    // Grid State: 0 = open, 1 = perimeter wall, 2 = player block, 3 = captured tile
+    this.grid = [];
+    this.blockMeshes = new Map(); // key "gx,gz" -> THREE.Mesh
+    this.capturedMeshes = new Map();
+
+    // Entities
+    this.balls = [];
+
+    // Player Transform & Controls
+    this.playerPos = new THREE.Vector3(0, this.cfg.EYE_HEIGHT, 16);
+    this.playerYaw = 0;
+    this.playerPitch = 0;
+    this.keys = {};
+    this.mouseButtons = { left: false, right: false };
+    this.pointerLocked = false;
+    this.isDraggingLook = false;
+    this.lastMouseX = 0;
+    this.lastMouseY = 0;
+    this.raycaster = new THREE.Raycaster();
+
+    // Co-Op Partner (Remote P2P Player or Co-Op Bot)
+    this.partner = {
+      active: false,
+      isBot: false,
+      pos: new THREE.Vector3(4, this.cfg.EYE_HEIGHT, 16),
+      yaw: 0,
+      mesh: null,
+      buildTimer: 0
+    };
+
+    // Target Grid Cell Preview
+    this.targetCell = { gx: 12, gz: 12, valid: false, canDelete: false, blockedByBall: false };
+
+    this.clock = new THREE.Clock();
+    this.initThree();
+    this.initArenaGeometry();
+    this.init3DVRMenuAndHUD();
+    this.initControls();
+    this.checkWebXRSupport();
+    this.bindUIEvents();
+    this.startRenderLoop();
+  }
+
+  initThree() {
+    this.container = document.getElementById('canvas-container');
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x050811);
+    this.scene.fog = new THREE.FogExp2(0x050811, 0.011);
+
+    // Camera Rig (Used for both Desktop FPS and WebXR VR Locomotion + Right-Stick Rotation)
+    this.cameraRig = new THREE.Group();
+    this.cameraRig.position.set(this.playerPos.x, 0, this.playerPos.z);
+
+    this.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 160);
+    this.camera.position.set(0, this.cfg.EYE_HEIGHT, 0);
+    this.cameraRig.add(this.camera);
+    this.scene.add(this.cameraRig);
+
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.xr.enabled = true;
+    this.container.appendChild(this.renderer.domElement);
+
+    // Lighting
+    const ambient = new THREE.AmbientLight(0x94a3b8, 0.78);
+    this.scene.add(ambient);
+
+    const dirLight = new THREE.DirectionalLight(0xe0f2fe, 0.95);
+    dirLight.position.set(18, 36, 22);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.width = 1024;
+    dirLight.shadow.mapSize.height = 1024;
+    this.scene.add(dirLight);
+
+    const pointLight1 = new THREE.PointLight(0x38bdf8, 0.8, 55);
+    pointLight1.position.set(-16, 10, -16);
+    this.scene.add(pointLight1);
+
+    const pointLight2 = new THREE.PointLight(0x10b981, 0.8, 55);
+    pointLight2.position.set(16, 10, 16);
+    this.scene.add(pointLight2);
+
+    // VR Controller Visual Laser Rays (Left = Amber/Red Delete Ray, Right = Cyan Build Ray)
+    this.vrControllerLeft = this.renderer.xr.getController(0);
+    this.vrControllerRight = this.renderer.xr.getController(1);
+    const rayGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(0, 0, -8)
+    ]);
+    const rayMatL = new THREE.LineBasicMaterial({ color: 0xf59e0b });
+    const rayMatR = new THREE.LineBasicMaterial({ color: 0x38bdf8 });
+    this.vrControllerLeft.add(new THREE.Line(rayGeo, rayMatL));
+    this.vrControllerRight.add(new THREE.Line(rayGeo, rayMatR));
+
+    // Select event on VR controllers (fires when trigger is clicked in WebXR)
+    this.vrControllerLeft.addEventListener('selectstart', () => {
+      if (this.state === 'gameover' || this.state === 'levelclear') {
+        this.checkAndActivate3DMenuButton(this.vrControllerLeft);
+      } else if (this.state === 'playing') {
+        this.tryRemoveBlock();
+      }
+    });
+    this.vrControllerRight.addEventListener('selectstart', () => {
+      if (this.state === 'gameover' || this.state === 'levelclear') {
+        this.checkAndActivate3DMenuButton(this.vrControllerRight);
+      } else if (this.state === 'playing') {
+        this.tryPlaceBlock();
+      }
+    });
+
+    this.cameraRig.add(this.vrControllerLeft);
+    this.cameraRig.add(this.vrControllerRight);
+
+    window.addEventListener('resize', () => this.onWindowResize());
+  }
+
+  onWindowResize() {
+    if (!this.camera || !this.renderer) return;
+    this.camera.aspect = window.innerWidth / window.innerHeight;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  // Coordinate conversions between World (meters) and Arena Grid (0 .. GRID_SIZE-1)
+  gridToWorld(gx, gz) {
+    const half = (this.cfg.GRID_SIZE * this.cfg.CELL_SIZE) / 2;
+    return {
+      x: (gx + 0.5) * this.cfg.CELL_SIZE - half,
+      z: (gz + 0.5) * this.cfg.CELL_SIZE - half
+    };
+  }
+
+  worldToGrid(wx, wz) {
+    const half = (this.cfg.GRID_SIZE * this.cfg.CELL_SIZE) / 2;
+    const gx = Math.floor((wx + half) / this.cfg.CELL_SIZE);
+    const gz = Math.floor((wz + half) / this.cfg.CELL_SIZE);
+    return {
+      gx: Math.max(0, Math.min(this.cfg.GRID_SIZE - 1, gx)),
+      gz: Math.max(0, Math.min(this.cfg.GRID_SIZE - 1, gz))
+    };
+  }
+
+  initArenaGeometry() {
+    this.arenaGroup = new THREE.Group();
+    this.scene.add(this.arenaGroup);
+
+    const arenaWidth = this.cfg.GRID_SIZE * this.cfg.CELL_SIZE;
+
+    // Cyber Floor Plane
+    const floorGeo = new THREE.PlaneGeometry(arenaWidth, arenaWidth);
+    const floorMat = new THREE.MeshStandardMaterial({
+      color: 0x0b1324,
+      roughness: 0.65,
+      metalness: 0.25
+    });
+    const floorMesh = new THREE.Mesh(floorGeo, floorMat);
+    floorMesh.rotation.x = -Math.PI / 2;
+    floorMesh.receiveShadow = true;
+    this.arenaGroup.add(floorMesh);
+
+    // High-contrast Grid Helper matching exact cell boundaries
+    const gridHelper = new THREE.GridHelper(arenaWidth, this.cfg.GRID_SIZE, 0x38bdf8, 0x1e293b);
+    gridHelper.position.y = 0.02;
+    this.arenaGroup.add(gridHelper);
+
+    // Shared Reusable Geometries & Materials for Blocks & Captured Tiles
+    this.wallGeo = new THREE.BoxGeometry(this.cfg.CELL_SIZE * 0.98, this.cfg.WALL_HEIGHT, this.cfg.CELL_SIZE * 0.98);
+    this.perimMat = new THREE.MeshStandardMaterial({
+      color: 0x1e293b,
+      emissive: 0x0f172a,
+      roughness: 0.4,
+      metalness: 0.6
+    });
+    this.playerBlockMat = new THREE.MeshStandardMaterial({
+      color: 0x0284c7,
+      emissive: 0x0369a1,
+      emissiveIntensity: 0.45,
+      roughness: 0.25,
+      metalness: 0.5
+    });
+    this.partnerBlockMat = new THREE.MeshStandardMaterial({
+      color: 0x10b981,
+      emissive: 0x047857,
+      emissiveIntensity: 0.45,
+      roughness: 0.25,
+      metalness: 0.5
+    });
+    this.capturedTileGeo = new THREE.BoxGeometry(this.cfg.CELL_SIZE * 0.96, 0.24, this.cfg.CELL_SIZE * 0.96);
+    this.capturedTileMat = new THREE.MeshStandardMaterial({
+      color: 0x10b981,
+      emissive: 0x059669,
+      emissiveIntensity: 0.5,
+      roughness: 0.3
+    });
+
+    // Holographic Block Placement / Deletion Ghost Preview
+    const ghostGeo = new THREE.BoxGeometry(this.cfg.CELL_SIZE * 0.96, this.cfg.WALL_HEIGHT * 0.96, this.cfg.CELL_SIZE * 0.96);
+    this.ghostMatValid = new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.78
+    });
+    this.ghostMatDelete = new THREE.MeshBasicMaterial({
+      color: 0xf59e0b,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.88
+    });
+    this.ghostMatInvalid = new THREE.MeshBasicMaterial({
+      color: 0xf43f5e,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.55
+    });
+    this.ghostMesh = new THREE.Mesh(ghostGeo, this.ghostMatValid);
+    this.ghostMesh.position.y = this.cfg.WALL_HEIGHT / 2;
+    this.scene.add(this.ghostMesh);
+
+    // Co-Op Partner 3D Avatar
+    this.partner.mesh = this.createPartnerAvatarMesh();
+    this.partner.mesh.visible = false;
+    this.scene.add(this.partner.mesh);
+
+    // Minimap 2D Canvas Context
+    this.minimapCanvas = document.getElementById('minimap-canvas');
+    this.minimapCtx = this.minimapCanvas ? this.minimapCanvas.getContext('2d') : null;
+  }
+
+  // Create 3D In-World Interactive Restart / Next-Wave Button Panel + 3D Floating VR Status HUD
+  init3DVRMenuAndHUD() {
+    // 1. 3D Floating Modal Group (Appears in 3D space when you die or clear a level so VR users can see & click it!)
+    this.vrMenuGroup = new THREE.Group();
+    this.vrMenuGroup.visible = false;
+    this.scene.add(this.vrMenuGroup);
+
+    // Backing Panel Canvas & Texture
+    this.vrPanelCanvas = document.createElement('canvas');
+    this.vrPanelCanvas.width = 1024;
+    this.vrPanelCanvas.height = 576;
+    this.vrPanelCtx = this.vrPanelCanvas.getContext('2d');
+    this.vrPanelTexture = new THREE.CanvasTexture(this.vrPanelCanvas);
+
+    const panelGeo = new THREE.PlaneGeometry(2.8, 1.58);
+    const panelMat = new THREE.MeshBasicMaterial({
+      map: this.vrPanelTexture,
+      transparent: true,
+      side: THREE.DoubleSide
+    });
+    this.vrPanelMesh = new THREE.Mesh(panelGeo, panelMat);
+    this.vrMenuGroup.add(this.vrPanelMesh);
+
+    // 3D Protruding Clickable Button Mesh (Raycast target for VR Triggers & Mouse Click)
+    this.vrBtnCanvas = document.createElement('canvas');
+    this.vrBtnCanvas.width = 768;
+    this.vrBtnCanvas.height = 192;
+    this.vrBtnCtx = this.vrBtnCanvas.getContext('2d');
+    this.vrBtnTexture = new THREE.CanvasTexture(this.vrBtnCanvas);
+
+    const btnGeo = new THREE.BoxGeometry(1.95, 0.48, 0.12);
+    const btnMat = new THREE.MeshBasicMaterial({ map: this.vrBtnTexture });
+    this.vrRestartButtonMesh = new THREE.Mesh(btnGeo, btnMat);
+    this.vrRestartButtonMesh.position.set(0, -0.34, 0.09);
+    this.vrMenuGroup.add(this.vrRestartButtonMesh);
+
+    // 2. 3D Compact Floating HUD Banner attached to Camera (Visible inside VR Headset)
+    this.vrHudCanvas = document.createElement('canvas');
+    this.vrHudCanvas.width = 640;
+    this.vrHudCanvas.height = 96;
+    this.vrHudCtx = this.vrHudCanvas.getContext('2d');
+    this.vrHudTexture = new THREE.CanvasTexture(this.vrHudCanvas);
+
+    const hudPlaneGeo = new THREE.PlaneGeometry(0.95, 0.14);
+    const hudPlaneMat = new THREE.MeshBasicMaterial({
+      map: this.vrHudTexture,
+      transparent: true,
+      depthTest: false
+    });
+    this.vrHudMesh = new THREE.Mesh(hudPlaneGeo, hudPlaneMat);
+    this.vrHudMesh.position.set(0, 0.42, -1.35);
+    this.camera.add(this.vrHudMesh);
+  }
+
+  render3DVRHudTexture() {
+    if (!this.vrHudCtx) return;
+    const ctx = this.vrHudCtx;
+    const W = this.vrHudCanvas.width;
+    const H = this.vrHudCanvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    ctx.fillStyle = 'rgba(7, 11, 20, 0.78)';
+    ctx.strokeStyle = 'rgba(56, 189, 248, 0.7)';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.roundRect(4, 4, W - 8, H - 8, 18);
+    ctx.fill();
+    ctx.stroke();
+
+    const untrapped = this.balls.filter(b => !b.trapped).length;
+    const totalBalls = this.balls.length;
+    const hearts = '♥'.repeat(Math.max(0, this.lives)) || '0';
+
+    ctx.font = 'bold 26px Inter, sans-serif';
+    ctx.fillStyle = '#f43f5e';
+    ctx.fillText(`LIVES: ${hearts}`, 24, 58);
+
+    ctx.fillStyle = '#10b981';
+    ctx.fillText(`TRAPPED: ${totalBalls - untrapped}/${totalBalls}`, 235, 58);
+
+    ctx.fillStyle = '#38bdf8';
+    ctx.fillText(`AREA: ${this.capturedPct}%`, 465, 58);
+
+    this.vrHudTexture.needsUpdate = true;
+  }
+
+  show3DVRModal(mode, isHovered = false) {
+    // mode: 'gameover' | 'levelclear'
+    this.vrMenuGroup.visible = true;
+
+    // Position the 3D billboard 3.1 meters directly in front of the player
+    let forward = new THREE.Vector3(-Math.sin(this.playerYaw), 0, -Math.cos(this.playerYaw)).normalize();
+    if (this.renderer.xr.isPresenting) {
+      const camQuat = new THREE.Quaternion();
+      this.camera.getWorldQuaternion(camQuat);
+      forward.set(0, 0, -1).applyQuaternion(camQuat);
+      forward.y = 0;
+      if (forward.lengthSq() > 0.001) forward.normalize();
+    }
+
+    const menuPos = new THREE.Vector3(
+      this.playerPos.x + forward.x * 3.1,
+      this.cfg.EYE_HEIGHT + 0.05,
+      this.playerPos.z + forward.z * 3.1
+    );
+    this.vrMenuGroup.position.copy(menuPos);
+    this.vrMenuGroup.lookAt(this.playerPos.x, this.cfg.EYE_HEIGHT, this.playerPos.z);
+
+    this.draw3DVRModalTextures(mode, isHovered);
+  }
+
+  draw3DVRModalTextures(mode, isHovered = false) {
+    if (!this.vrPanelCtx || !this.vrBtnCtx) return;
+    const ctx = this.vrPanelCtx;
+    const W = this.vrPanelCanvas.width;
+    const H = this.vrPanelCanvas.height;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(9, 14, 28, 0.95)';
+    ctx.strokeStyle = mode === 'gameover' ? '#f43f5e' : '#10b981';
+    ctx.lineWidth = 10;
+    ctx.beginPath();
+    ctx.roundRect(12, 12, W - 24, H - 24, 32);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.font = 'extrabold 64px Inter, sans-serif';
+    ctx.fillStyle = mode === 'gameover' ? '#fb7185' : '#34d399';
+    ctx.fillText(mode === 'gameover' ? 'YOU DIED — GAME OVER' : 'SECTOR CONTAINED!', W / 2, 130);
+
+    ctx.font = 'bold 34px Inter, sans-serif';
+    ctx.fillStyle = '#e2e8f0';
+    const subText = mode === 'gameover'
+      ? `Reached Sector Level ${this.level}  •  Final Score: ${this.score.toLocaleString()}`
+      : `Captured ${this.capturedPct}% of Arena  •  Score: ${this.score.toLocaleString()}`;
+    ctx.fillText(subText, W / 2, 215);
+
+    ctx.font = '28px Inter, sans-serif';
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillText('Aim VR Controller or Mouse at the 3D Button below & Pull Trigger / Click:', W / 2, 290);
+    this.vrPanelTexture.needsUpdate = true;
+
+    // Draw 3D Clickable Button Texture
+    const bctx = this.vrBtnCtx;
+    const BW = this.vrBtnCanvas.width;
+    const BH = this.vrBtnCanvas.height;
+    bctx.clearRect(0, 0, BW, BH);
+
+    bctx.fillStyle = isHovered
+      ? (mode === 'gameover' ? '#10b981' : '#38bdf8')
+      : (mode === 'gameover' ? '#e11d48' : '#059669');
+    bctx.strokeStyle = '#ffffff';
+    bctx.lineWidth = isHovered ? 10 : 5;
+    bctx.beginPath();
+    bctx.roundRect(8, 8, BW - 16, BH - 16, 24);
+    bctx.fill();
+    bctx.stroke();
+
+    bctx.textAlign = 'center';
+    bctx.font = 'extrabold 44px Inter, sans-serif';
+    bctx.fillStyle = '#ffffff';
+    bctx.fillText(
+      mode === 'gameover' ? '↻ CLICK / TRIGGER TO RESTART' : '▶ CLICK / TRIGGER NEXT WAVE',
+      BW / 2,
+      112
+    );
+    this.vrBtnTexture.needsUpdate = true;
+  }
+
+  checkAndActivate3DMenuButton(controllerOrCamera) {
+    if (!this.vrMenuGroup.visible) return false;
+    const origin = new THREE.Vector3();
+    const quat = new THREE.Quaternion();
+    const dir = new THREE.Vector3(0, 0, -1);
+
+    controllerOrCamera.getWorldPosition(origin);
+    controllerOrCamera.getWorldQuaternion(quat);
+    dir.applyQuaternion(quat);
+
+    this.raycaster.set(origin, dir);
+    const hits = this.raycaster.intersectObjects([this.vrRestartButtonMesh, this.vrPanelMesh], false);
+    if (hits.length > 0) {
+      this.triggerModalPrimaryAction();
+      return true;
+    }
+    return false;
+  }
+
+  triggerModalPrimaryAction() {
+    if (this.state === 'gameover') {
+      this.restartGameSession();
+    } else if (this.state === 'levelclear') {
+      document.getElementById('modal-level-clear').classList.add('hidden');
+      this.vrMenuGroup.visible = false;
+      this.startLevel(this.level + 1);
+    }
+  }
+
+  restartGameSession() {
+    document.getElementById('modal-game-over').classList.add('hidden');
+    document.getElementById('modal-level-clear').classList.add('hidden');
+    this.vrMenuGroup.visible = false;
+    this.lives = this.configuredLives;
+    this.score = 0;
+    this.startLevel(1);
+  }
+
+  createPartnerAvatarMesh() {
+    const group = new THREE.Group();
+    const bodyGeo = new THREE.CylinderGeometry(0.45, 0.35, 1.35, 16);
+    const bodyMat = new THREE.MeshStandardMaterial({
+      color: 0x10b981,
+      emissive: 0x059669,
+      emissiveIntensity: 0.4
+    });
+    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    body.position.y = 0.75;
+    group.add(body);
+
+    const headGeo = new THREE.SphereGeometry(0.35, 16, 16);
+    const headMat = new THREE.MeshStandardMaterial({ color: 0xe2e8f0, metalness: 0.5, roughness: 0.2 });
+    const head = new THREE.Mesh(headGeo, headMat);
+    head.position.y = 1.65;
+    group.add(head);
+
+    const visorGeo = new THREE.BoxGeometry(0.5, 0.22, 0.35);
+    const visorMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8 });
+    const visor = new THREE.Mesh(visorGeo, visorMat);
+    visor.position.set(0, 1.66, -0.22);
+    group.add(visor);
+
+    return group;
+  }
+
+  resetGridAndWalls() {
+    this.blockMeshes.forEach(mesh => this.arenaGroup.remove(mesh));
+    this.blockMeshes.clear();
+    this.capturedMeshes.forEach(mesh => this.arenaGroup.remove(mesh));
+    this.capturedMeshes.clear();
+
+    const N = this.cfg.GRID_SIZE;
+    this.grid = Array.from({ length: N }, () => Array(N).fill(0));
+
+    for (let gx = 0; gx < N; gx++) {
+      for (let gz = 0; gz < N; gz++) {
+        if (gx === 0 || gx === N - 1 || gz === 0 || gz === N - 1) {
+          this.grid[gx][gz] = 1; // Perimeter wall
+          const pos = this.gridToWorld(gx, gz);
+          const wall = new THREE.Mesh(this.wallGeo, this.perimMat);
+          wall.position.set(pos.x, this.cfg.WALL_HEIGHT / 2, pos.z);
+          wall.castShadow = true;
+          wall.receiveShadow = true;
+          this.arenaGroup.add(wall);
+          this.blockMeshes.set(`${gx},${gz}`, wall);
+        }
+      }
+    }
+    this.capturedPct = 0;
+  }
+
+  spawnBallsForLevel(levelNum) {
+    this.balls.forEach(b => {
+      this.scene.remove(b.mesh);
+      if (b.cageMesh) this.scene.remove(b.cageMesh);
+    });
+    this.balls = [];
+
+    // Use the user-selected ball count on Level 1, adding +1 ball per subsequent wave (up to 12)
+    const ballCount = Math.min(12, this.configuredBalls + (levelNum - 1));
+    const types = [
+      { name: 'Kinetic Titan', color: 0xf43f5e, emissive: 0xbe123c, radius: 1.15, speed: 9.2 },
+      { name: 'Volt Striker', color: 0xf59e0b, emissive: 0xb45309, radius: 1.00, speed: 11.4 },
+      { name: 'Plasma Juggernaut', color: 0xa855f7, emissive: 0x6b21a8, radius: 1.28, speed: 8.2 }
+    ];
+
+    for (let i = 0; i < ballCount; i++) {
+      const t = types[i % types.length];
+      const geo = new THREE.SphereGeometry(t.radius, 28, 28);
+      const mat = new THREE.MeshStandardMaterial({
+        color: t.color,
+        emissive: t.emissive,
+        emissiveIntensity: 0.55,
+        roughness: 0.18,
+        metalness: 0.65
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.castShadow = true;
+
+      // Wireframe Equatorial Ring for spin clarity
+      const ringGeo = new THREE.TorusGeometry(t.radius * 1.03, 0.06, 8, 24);
+      const ringMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+      const ring = new THREE.Mesh(ringGeo, ringMat);
+      mesh.add(ring);
+
+      // Spawn in upper/central arena well away from player spawn at z = +16
+      const angle = (i / Math.max(1, ballCount)) * Math.PI * 1.4 - Math.PI * 0.7;
+      const rowOffset = Math.floor(i / 4) * 4.5;
+      const sx = Math.sin(angle) * (10 + rowOffset);
+      const sz = -7 + Math.cos(angle) * 5 - rowOffset;
+      mesh.position.set(sx, t.radius, sz);
+
+      const dirAngle = (i * 1.7 + 0.65);
+      const speed = t.speed * (1 + (levelNum - 1) * 0.07);
+
+      this.scene.add(mesh);
+      this.balls.push({
+        id: i,
+        type: t.name,
+        radius: t.radius,
+        pos: mesh.position,
+        vel: new THREE.Vector3(Math.cos(dirAngle) * speed, 0, Math.sin(dirAngle) * speed),
+        baseSpeed: speed,
+        trapped: false,
+        mesh,
+        cageMesh: null
+      });
+    }
+  }
+
+  // Strict AABB + Lookahead Check: Returns true ONLY if no ball is touching, inside, or about to enter cell (gx, gz)
+  isCellSafeFromBalls(gx, gz) {
+    const worldPos = this.gridToWorld(gx, gz);
+    const halfBox = this.cfg.CELL_SIZE * 0.5;
+    const minX = worldPos.x - halfBox;
+    const maxX = worldPos.x + halfBox;
+    const minZ = worldPos.z - halfBox;
+    const maxZ = worldPos.z + halfBox;
+
+    for (const b of this.balls) {
+      const safeRadius = b.radius + this.cfg.BALL_CLEARANCE_MARGIN;
+
+      // 1. Check current ball position against cell AABB
+      const cx1 = Math.max(minX, Math.min(b.pos.x, maxX));
+      const cz1 = Math.max(minZ, Math.min(b.pos.z, maxZ));
+      if (Math.hypot(b.pos.x - cx1, b.pos.z - cz1) < safeRadius) {
+        return false;
+      }
+
+      // 2. Check short lookahead ball position (0.12s ahead) so a fast ball cannot clip into a newly spawning wall
+      const lookX = b.pos.x + b.vel.x * 0.12;
+      const lookZ = b.pos.z + b.vel.z * 0.12;
+      const cx2 = Math.max(minX, Math.min(lookX, maxX));
+      const cz2 = Math.max(minZ, Math.min(lookZ, maxZ));
+      if (Math.hypot(lookX - cx2, lookZ - cz2) < safeRadius * 0.9) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Place a single wall block at (gx, gz)
+  placeBlockAt(gx, gz, fromPartner = false, broadcast = true) {
+    const N = this.cfg.GRID_SIZE;
+    if (gx <= 0 || gx >= N - 1 || gz <= 0 || gz >= N - 1) return false;
+    if (this.grid[gx][gz] !== 0) return false;
+
+    const worldPos = this.gridToWorld(gx, gz);
+
+    // Prevent placing block directly on top of local player
+    const distToPlayer = Math.hypot(worldPos.x - this.playerPos.x, worldPos.z - this.playerPos.z);
+    if (!fromPartner && distToPlayer < 1.25) return false;
+
+    // Prevent placing block on or near any giant ball!
+    if (!this.isCellSafeFromBalls(gx, gz)) {
+      if (!fromPartner) {
+        window.soundManager.playInvalidAction();
+        this.showToast('Cannot place wall directly on a moving ball!', 'rose');
+      }
+      return false;
+    }
+
+    this.grid[gx][gz] = 2;
+    const mat = fromPartner ? this.partnerBlockMat : this.playerBlockMat;
+    const blockMesh = new THREE.Mesh(this.wallGeo, mat);
+    blockMesh.position.set(worldPos.x, this.cfg.WALL_HEIGHT / 2, worldPos.z);
+    blockMesh.castShadow = true;
+    blockMesh.receiveShadow = true;
+    this.arenaGroup.add(blockMesh);
+    this.blockMeshes.set(`${gx},${gz}`, blockMesh);
+
+    window.soundManager.playBlockPlace();
+    this.score += 15;
+
+    if (broadcast && this.networkMode !== 'single') {
+      window.networkManager.send({
+        type: 'PLACE_BLOCK',
+        gx,
+        gz
+      });
+    }
+
+    // Run Moraff's Entrap + JezzBall Flood-Fill Enclosure Check
+    this.evaluateEnclosuresAndTraps();
+    this.updateHUD();
+    return true;
+  }
+
+  // Delete a single player-built block at (gx, gz) so players can never get trapped!
+  removeBlockAt(gx, gz, broadcast = true) {
+    const N = this.cfg.GRID_SIZE;
+    if (gx <= 0 || gx >= N - 1 || gz <= 0 || gz >= N - 1) return false;
+    // Only allow deleting player-built blocks (2) or captured floor tiles (3), never outer perimeter walls (1)
+    if (this.grid[gx][gz] !== 2 && this.grid[gx][gz] !== 3) return false;
+
+    const key = `${gx},${gz}`;
+    if (this.blockMeshes.has(key)) {
+      this.arenaGroup.remove(this.blockMeshes.get(key));
+      this.blockMeshes.delete(key);
+    }
+    if (this.capturedMeshes.has(key)) {
+      this.arenaGroup.remove(this.capturedMeshes.get(key));
+      this.capturedMeshes.delete(key);
+    }
+
+    this.grid[gx][gz] = 0;
+    window.soundManager.playBlockRemove();
+
+    if (broadcast && this.networkMode !== 'single') {
+      window.networkManager.send({
+        type: 'REMOVE_BLOCK',
+        gx,
+        gz
+      });
+    }
+
+    // Re-evaluate enclosures in case deleting this wall opened a captured region
+    this.recomputeAllCapturedRegions();
+    this.updateHUD();
+    return true;
+  }
+
+  // Recompute captured regions from scratch when a block is deleted so opened pockets become passable again
+  recomputeAllCapturedRegions() {
+    const N = this.cfg.GRID_SIZE;
+    // Clear existing captured floor tiles (3 -> 0) and recalculate strictly from current walls (1 and 2)
+    this.capturedMeshes.forEach(mesh => this.arenaGroup.remove(mesh));
+    this.capturedMeshes.clear();
+    for (let gx = 1; gx < N - 1; gx++) {
+      for (let gz = 1; gz < N - 1; gz++) {
+        if (this.grid[gx][gz] === 3) {
+          this.grid[gx][gz] = 0;
+        }
+      }
+    }
+    this.balls.forEach(b => {
+      if (b.trapped) {
+        b.trapped = false;
+        if (b.cageMesh) {
+          this.scene.remove(b.cageMesh);
+          b.cageMesh = null;
+        }
+      }
+    });
+    this.evaluateEnclosuresAndTraps(true);
+  }
+
+  // Connected-Components Flood-Fill for JezzBall Territory Capture & Moraff's Entrap Ball Boxing
+  evaluateEnclosuresAndTraps(silent = false) {
+    const N = this.cfg.GRID_SIZE;
+    const visited = Array.from({ length: N }, () => Array(N).fill(false));
+    const regions = [];
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+
+    for (let gx = 1; gx < N - 1; gx++) {
+      for (let gz = 1; gz < N - 1; gz++) {
+        if (this.grid[gx][gz] === 0 && !visited[gx][gz]) {
+          const queue = [[gx, gz]];
+          visited[gx][gz] = true;
+          const cells = [];
+
+          while (queue.length > 0) {
+            const [cx, cz] = queue.shift();
+            cells.push([cx, cz]);
+
+            for (const [dx, dz] of dirs) {
+              const nx = cx + dx;
+              const nz = cz + dz;
+              if (nx > 0 && nx < N - 1 && nz > 0 && nz < N - 1) {
+                if (!visited[nx][nz] && this.grid[nx][nz] === 0) {
+                  visited[nx][nz] = true;
+                  queue.push([nx, nz]);
+                }
+              }
+            }
+          }
+          regions.push(cells);
+        }
+      }
+    }
+
+    if (regions.length <= 1) {
+      this.recalculateCapturedPercentage();
+      this.checkLevelClearCondition();
+      return;
+    }
+
+    // Identify the largest open region (main arena floor)
+    let largestRegionIdx = 0;
+    for (let i = 1; i < regions.length; i++) {
+      if (regions[i].length > regions[largestRegionIdx].length) {
+        largestRegionIdx = i;
+      }
+    }
+
+    // Map each ball to its grid coordinate and player to player grid coordinate
+    const ballGridMap = new Map();
+    this.balls.forEach(ball => {
+      const g = this.worldToGrid(ball.pos.x, ball.pos.z);
+      ballGridMap.set(ball.id, g);
+    });
+    const playerGrid = this.worldToGrid(this.playerPos.x, this.playerPos.z);
+
+    let newlyCapturedCells = 0;
+    let newlyTrappedBalls = 0;
+
+    regions.forEach((cells, idx) => {
+      const cellSet = new Set(cells.map(([x, z]) => `${x},${z}`));
+      const ballsInRegion = [];
+      for (const ball of this.balls) {
+        const bg = ballGridMap.get(ball.id);
+        if (bg && cellSet.has(`${bg.gx},${bg.gz}`)) {
+          ballsInRegion.push(ball);
+        }
+      }
+
+      const playerInRegion = cellSet.has(`${playerGrid.gx},${playerGrid.gz}`);
+
+      // Case 1: Enclosed pocket with ZERO balls (and not the main open arena and player is not inside it) -> Capture & Seal!
+      if (ballsInRegion.length === 0 && idx !== largestRegionIdx && !playerInRegion) {
+        for (const [cx, cz] of cells) {
+          this.grid[cx][cz] = 3;
+          const w = this.gridToWorld(cx, cz);
+          const tileMesh = new THREE.Mesh(this.capturedTileGeo, this.capturedTileMat);
+          tileMesh.position.set(w.x, 0.12, w.z);
+          this.arenaGroup.add(tileMesh);
+          this.capturedMeshes.set(`${cx},${cz}`, tileMesh);
+          newlyCapturedCells++;
+        }
+      }
+
+      // Case 2: Moraff's Entrap Ball Trap! Balls boxed into a small enclosed room (<= BALL_TRAP_MAX_CELLS per ball)
+      if (ballsInRegion.length > 0 && cells.length <= this.cfg.BALL_TRAP_MAX_CELLS * ballsInRegion.length) {
+        ballsInRegion.forEach(ball => {
+          if (!ball.trapped) {
+            this.markBallContained(ball);
+            newlyTrappedBalls++;
+          }
+        });
+      }
+    });
+
+    if (!silent && newlyCapturedCells > 0) {
+      this.score += newlyCapturedCells * 35;
+      window.soundManager.playCaptureZone();
+      this.showToast(`Captured ${newlyCapturedCells} Arena Cells! (+${newlyCapturedCells * 35} pts)`, 'emerald');
+    }
+
+    if (!silent && newlyTrappedBalls > 0) {
+      this.score += newlyTrappedBalls * 1000;
+      window.soundManager.playBallTrapped();
+      this.showToast(`CONTAINED ${newlyTrappedBalls} GIANT BALL${newlyTrappedBalls > 1 ? 'S' : ''}! (+${newlyTrappedBalls * 1000} pts)`, 'cyan');
+    }
+
+    this.recalculateCapturedPercentage();
+    this.checkLevelClearCondition();
+  }
+
+  // Mark a ball as boxed-in/contained while keeping it bouncing inside its walled enclosure
+  markBallContained(ball) {
+    if (ball.trapped) return;
+    ball.trapped = true;
+
+    const cageGeo = new THREE.OctahedronGeometry(ball.radius * 1.28, 1);
+    const cageMat = new THREE.MeshBasicMaterial({
+      color: 0x10b981,
+      wireframe: true
+    });
+    const cageMesh = new THREE.Mesh(cageGeo, cageMat);
+    cageMesh.position.copy(ball.pos);
+    this.scene.add(cageMesh);
+    ball.cageMesh = cageMesh;
+  }
+
+  recalculateCapturedPercentage() {
+    const N = this.cfg.GRID_SIZE;
+    const totalInterior = (N - 2) * (N - 2);
+    let filled = 0;
+    for (let gx = 1; gx < N - 1; gx++) {
+      for (let gz = 1; gz < N - 1; gz++) {
+        if (this.grid[gx][gz] === 2 || this.grid[gx][gz] === 3) {
+          filled++;
+        }
+      }
+    }
+    this.capturedPct = Math.min(100, Math.round((filled / totalInterior) * 100));
+  }
+
+  checkLevelClearCondition() {
+    if (this.state !== 'playing') return;
+    const untrappedCount = this.balls.filter(b => !b.trapped).length;
+    if (untrappedCount === 0 || this.capturedPct >= this.cfg.TARGET_CAPTURE_PCT) {
+      this.balls.forEach(b => {
+        if (!b.trapped) this.markBallContained(b);
+      });
+      this.state = 'levelclear';
+      this.score += 1500 * this.level;
+      window.soundManager.playBallTrapped();
+      this.updateHUD();
+      this.showLevelClearModal();
+    }
+  }
+
+  // Get player's current aiming ray origin and horizontal direction
+  getAimRay() {
+    let dir = new THREE.Vector3(0, 0, -1);
+    let origin = new THREE.Vector3();
+
+    if (this.renderer.xr.isPresenting && this.vrControllerRight) {
+      this.vrControllerRight.getWorldPosition(origin);
+      const quat = new THREE.Quaternion();
+      this.vrControllerRight.getWorldQuaternion(quat);
+      dir.applyQuaternion(quat);
+      dir.y = 0;
+      if (dir.lengthSq() > 0.001) dir.normalize();
+    } else {
+      origin.copy(this.playerPos);
+      dir.set(-Math.sin(this.playerYaw), 0, -Math.cos(this.playerYaw)).normalize();
+    }
+    return { origin, dir };
+  }
+
+  // Compute grid cell ahead of player's gaze or VR controller
+  updateTargetCell() {
+    const { origin, dir } = this.getAimRay();
+
+    const targetWorldX = origin.x + dir.x * (this.buildRange * this.cfg.CELL_SIZE);
+    const targetWorldZ = origin.z + dir.z * (this.buildRange * this.cfg.CELL_SIZE);
+    const { gx, gz } = this.worldToGrid(targetWorldX, targetWorldZ);
+
+    const N = this.cfg.GRID_SIZE;
+    const inBounds = gx > 0 && gx < N - 1 && gz > 0 && gz < N - 1;
+    const cellVal = inBounds ? this.grid[gx][gz] : 1;
+    const safeFromBalls = inBounds && this.isCellSafeFromBalls(gx, gz);
+    const isEmptyAndSafe = inBounds && cellVal === 0 && safeFromBalls;
+    const canDelete = inBounds && (cellVal === 2 || cellVal === 3);
+
+    this.targetCell = {
+      gx,
+      gz,
+      valid: isEmptyAndSafe,
+      canDelete,
+      blockedByBall: inBounds && cellVal === 0 && !safeFromBalls
+    };
+
+    if (this.ghostMesh) {
+      const w = this.gridToWorld(gx, gz);
+      this.ghostMesh.position.set(w.x, this.cfg.WALL_HEIGHT / 2, w.z);
+      if (canDelete) {
+        this.ghostMesh.material = this.ghostMatDelete;
+      } else if (isEmptyAndSafe) {
+        this.ghostMesh.material = this.ghostMatValid;
+      } else {
+        this.ghostMesh.material = this.ghostMatInvalid;
+      }
+      this.ghostMesh.visible = this.state === 'playing';
+    }
+  }
+
+  // Trigger primary block placement action (Right Trigger in VR / Left Click or Space on Desktop)
+  tryPlaceBlock() {
+    if (this.state !== 'playing') return;
+    if (this.buildCooldownTimer > 0) return;
+
+    this.updateTargetCell();
+    if (this.targetCell.valid) {
+      const placed = this.placeBlockAt(this.targetCell.gx, this.targetCell.gz, false, true);
+      if (placed) {
+        this.buildCooldownTimer = this.cfg.BASE_BUILD_COOLDOWN;
+      }
+    } else if (this.targetCell.blockedByBall) {
+      this.buildCooldownTimer = 0.2;
+      window.soundManager.playInvalidAction();
+      this.showToast('Too close to a ball! Cannot build wall directly on a ball.', 'rose');
+    }
+  }
+
+  // Trigger secondary block deletion action (Left Trigger in VR / Right Click or F on Desktop)
+  tryRemoveBlock() {
+    if (this.state !== 'playing') return;
+    if (this.deleteCooldownTimer > 0) return;
+
+    this.updateTargetCell();
+
+    // 1. If the currently aimed targetCell has a player block, delete it directly
+    if (this.targetCell.canDelete) {
+      if (this.removeBlockAt(this.targetCell.gx, this.targetCell.gz, true)) {
+        this.deleteCooldownTimer = this.cfg.BASE_BUILD_COOLDOWN;
+        this.showToast('Deleted Block', 'amber');
+        return;
+      }
+    }
+
+    // 2. Otherwise scan along the player's look/controller ray (from 1 cell ahead up to MAX_BUILD_RANGE)
+    // so if a block is right in front of the player trapping them, it gets deleted immediately!
+    const { origin, dir } = this.getAimRay();
+    const N = this.cfg.GRID_SIZE;
+    for (let step = 1; step <= this.cfg.MAX_BUILD_RANGE; step++) {
+      const wx = origin.x + dir.x * (step * this.cfg.CELL_SIZE * 0.75);
+      const wz = origin.z + dir.z * (step * this.cfg.CELL_SIZE * 0.75);
+      const { gx, gz } = this.worldToGrid(wx, wz);
+      if (gx > 0 && gx < N - 1 && gz > 0 && gz < N - 1) {
+        if (this.grid[gx][gz] === 2 || this.grid[gx][gz] === 3) {
+          if (this.removeBlockAt(gx, gz, true)) {
+            this.deleteCooldownTimer = this.cfg.BASE_BUILD_COOLDOWN;
+            this.showToast('Deleted Block', 'amber');
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  // Poll Oculus Quest WebXR Controller Thumbsticks & Both Triggers
+  pollVRControllers() {
+    const session = this.renderer.xr.getSession();
+    if (!session) return { moveX: 0, moveZ: 0, turnX: 0 };
+
+    let moveX = 0;
+    let moveZ = 0;
+    let turnX = 0;
+
+    for (const source of session.inputSources) {
+      if (!source.gamepad) continue;
+      const gp = source.gamepad;
+      const axes = gp.axes;
+
+      // Standard xr-standard thumbstick axes are [2, 3], with fallback to [0, 1]
+      const stickX = Math.abs(axes[2] || 0) > 0.08 ? axes[2] : (axes[0] || 0);
+      const stickY = Math.abs(axes[3] || 0) > 0.08 ? axes[3] : (axes[1] || 0);
+
+      if (source.handedness === 'left') {
+        if (Math.abs(stickX) > 0.12) moveX = stickX;
+        if (Math.abs(stickY) > 0.12) moveZ = stickY;
+
+        // Left Trigger (buttons[0]) or Left Grip (buttons[1]): Delete single block (or click 3D Restart button if dead!)
+        const leftTrig = (gp.buttons[0] && gp.buttons[0].pressed) || (gp.buttons[1] && gp.buttons[1].pressed);
+        if (leftTrig) {
+          if (this.state === 'gameover' || this.state === 'levelclear') {
+            if (!this._vrLeftMenuLatch) {
+              this._vrLeftMenuLatch = true;
+              if (!this.checkAndActivate3DMenuButton(this.vrControllerLeft)) {
+                this.triggerModalPrimaryAction();
+              }
+            }
+          } else {
+            this.tryRemoveBlock();
+          }
+        } else {
+          this._vrLeftMenuLatch = false;
+        }
+      } else if (source.handedness === 'right') {
+        if (Math.abs(stickX) > 0.15) turnX = stickX;
+
+        // Right Trigger (buttons[0]): Place single block (or click 3D Restart button if dead!)
+        if (gp.buttons[0] && gp.buttons[0].pressed) {
+          if (this.state === 'gameover' || this.state === 'levelclear') {
+            if (!this._vrRightMenuLatch) {
+              this._vrRightMenuLatch = true;
+              if (!this.checkAndActivate3DMenuButton(this.vrControllerRight)) {
+                this.triggerModalPrimaryAction();
+              }
+            }
+          } else {
+            this.tryPlaceBlock();
+          }
+        } else {
+          this._vrRightMenuLatch = false;
+        }
+
+        // Right Grip (buttons[1]) or A/B buttons (buttons[4]/buttons[5]) also delete single block
+        if ((gp.buttons[1] && gp.buttons[1].pressed) || (gp.buttons[4] && gp.buttons[4].pressed)) {
+          this.tryRemoveBlock();
+        }
+      }
+    }
+
+    return { moveX, moveZ, turnX };
+  }
+
+  updatePlayerMovement(dt) {
+    let forwardInput = 0;
+    let strafeInput = 0;
+    let turnInput = 0;
+
+    // 1. Keyboard WASD + Arrow Controls (Desktop Mode)
+    if (this.keys['KeyW'] || this.keys['ArrowUp']) forwardInput += 1;
+    if (this.keys['KeyS'] || this.keys['ArrowDown']) forwardInput -= 1;
+    if (this.keys['KeyA'] || this.keys['ArrowLeft']) strafeInput -= 1;
+    if (this.keys['KeyD'] || this.keys['ArrowRight']) strafeInput += 1;
+    if (this.keys['KeyQ']) turnInput += 1.6;
+    if (this.keys['KeyE']) turnInput -= 1.6;
+
+    // 2. Oculus Quest VR Controller Thumbsticks (Left stick = Move/Strafe, Right stick = Rotate character)
+    if (this.renderer.xr.isPresenting) {
+      const vrInput = this.pollVRControllers();
+      forwardInput += -vrInput.moveZ;
+      strafeInput += vrInput.moveX;
+      turnInput += -vrInput.turnX * this.cfg.VR_TURN_SPEED;
+    }
+
+    if (Math.abs(turnInput) > 0.001) {
+      this.playerYaw += turnInput * dt;
+    }
+
+    // Calculate movement vector relative to character Yaw
+    if (Math.abs(forwardInput) > 0.01 || Math.abs(strafeInput) > 0.01) {
+      const len = Math.hypot(forwardInput, strafeInput);
+      const normF = forwardInput / Math.max(1, len);
+      const normS = strafeInput / Math.max(1, len);
+
+      const sinY = Math.sin(this.playerYaw);
+      const cosY = Math.cos(this.playerYaw);
+
+      const moveDx = (-sinY * normF + cosY * normS);
+      const moveDz = (-cosY * normF - sinY * normS);
+
+      const speed = this.cfg.MOVE_SPEED * (this.keys['ShiftLeft'] || this.keys['ShiftRight'] ? this.cfg.SPRINT_MULTIPLIER : 1.0);
+      const nextX = this.playerPos.x + moveDx * speed * dt;
+      const nextZ = this.playerPos.z + moveDz * speed * dt;
+
+      if (this.canPlayerStandAt(nextX, this.playerPos.z)) {
+        this.playerPos.x = nextX;
+      }
+      if (this.canPlayerStandAt(this.playerPos.x, nextZ)) {
+        this.playerPos.z = nextZ;
+      }
+    }
+
+    // Apply transform to Camera Rig
+    this.cameraRig.position.set(this.playerPos.x, 0, this.playerPos.z);
+    if (this.renderer.xr.isPresenting) {
+      this.cameraRig.rotation.set(0, this.playerYaw, 0);
+    } else {
+      this.cameraRig.rotation.set(0, 0, 0);
+      this.camera.rotation.order = 'YXZ';
+      this.camera.rotation.y = this.playerYaw;
+      this.camera.rotation.x = this.playerPitch;
+    }
+
+    if (this.mouseButtons.left || this.keys['Space']) {
+      this.tryPlaceBlock();
+    }
+    if (this.mouseButtons.right) {
+      this.tryRemoveBlock();
+    }
+  }
+
+  canPlayerStandAt(wx, wz) {
+    const half = (this.cfg.GRID_SIZE * this.cfg.CELL_SIZE) / 2 - this.cfg.CELL_SIZE - 0.55;
+    if (wx < -half || wx > half || wz < -half || wz > half) return false;
+    const { gx, gz } = this.worldToGrid(wx, wz);
+    const cell = this.grid[gx] ? this.grid[gx][gz] : 1;
+    return cell !== 1 && cell !== 2;
+  }
+
+  // Sub-stepped Circle-vs-AABB Physics with Continuous Depenetration so Balls NEVER Get Stuck!
+  updateBallsPhysics(dt) {
+    const subSteps = 3;
+    const subDt = dt / subSteps;
+
+    for (let step = 0; step < subSteps; step++) {
+      for (let i = 0; i < this.balls.length; i++) {
+        const ball = this.balls[i];
+
+        // Advance ball position
+        ball.pos.x += ball.vel.x * subDt;
+        ball.pos.z += ball.vel.z * subDt;
+
+        // Resolve wall collisions with exact Circle-vs-AABB depenetration push-out + reflection
+        this.resolveBallWallCollisions(ball);
+
+        // Rotate visual mesh and containment cage
+        ball.mesh.rotation.x += ball.vel.z * subDt * 0.6;
+        ball.mesh.rotation.z -= ball.vel.x * subDt * 0.6;
+        if (ball.cageMesh) {
+          ball.cageMesh.position.copy(ball.pos);
+          ball.cageMesh.rotation.y += subDt * 1.4;
+        }
+      }
+
+      // Ball-to-Ball elastic collision
+      for (let i = 0; i < this.balls.length; i++) {
+        const ball = this.balls[i];
+        for (let j = i + 1; j < this.balls.length; j++) {
+          const other = this.balls[j];
+          const dx = other.pos.x - ball.pos.x;
+          const dz = other.pos.z - ball.pos.z;
+          const dist = Math.hypot(dx, dz);
+          const minDist = ball.radius + other.radius;
+          if (dist > 0.0001 && dist < minDist) {
+            const nx = dx / dist;
+            const nz = dz / dist;
+            const overlap = (minDist - dist) * 0.52;
+            ball.pos.x -= nx * overlap;
+            ball.pos.z -= nz * overlap;
+            other.pos.x += nx * overlap;
+            other.pos.z += nz * overlap;
+
+            const kx = ball.vel.x - other.vel.x;
+            const kz = ball.vel.z - other.vel.z;
+            const p = nx * kx + nz * kz;
+            if (p > 0) {
+              ball.vel.x -= p * nx;
+              ball.vel.z -= p * nz;
+              other.vel.x += p * nx;
+              other.vel.z += p * nz;
+              this.normalizeBallSpeed(ball);
+              this.normalizeBallSpeed(other);
+            }
+          }
+        }
+      }
+    }
+
+    // Check collision with Local Player once per frame
+    for (const ball of this.balls) {
+      const pDist = Math.hypot(ball.pos.x - this.playerPos.x, ball.pos.z - this.playerPos.z);
+      if (pDist < ball.radius + this.cfg.PLAYER_RADIUS) {
+        const nx = (ball.pos.x - this.playerPos.x) / Math.max(0.1, pDist);
+        const nz = (ball.pos.z - this.playerPos.z) / Math.max(0.1, pDist);
+        ball.pos.x = this.playerPos.x + nx * (ball.radius + this.cfg.PLAYER_RADIUS + 0.15);
+        ball.pos.z = this.playerPos.z + nz * (ball.radius + this.cfg.PLAYER_RADIUS + 0.15);
+        ball.vel.set(nx * ball.baseSpeed, 0, nz * ball.baseSpeed);
+
+        if (this.invulnTimer <= 0) {
+          this.onPlayerHitByBall();
+        }
+      }
+    }
+  }
+
+  normalizeBallSpeed(ball) {
+    const mag = Math.hypot(ball.vel.x, ball.vel.z);
+    if (mag < 0.01) {
+      ball.vel.set(ball.baseSpeed, 0, 0);
+    } else {
+      ball.vel.x = (ball.vel.x / mag) * ball.baseSpeed;
+      ball.vel.z = (ball.vel.z / mag) * ball.baseSpeed;
+    }
+  }
+
+  // Exact Circle-vs-AABB depenetration and normal reflection so balls NEVER get stuck on walls
+  resolveBallWallCollisions(ball) {
+    const N = this.cfg.GRID_SIZE;
+    const cs = this.cfg.CELL_SIZE;
+    const halfBox = cs * 0.5;
+    const { gx, gz } = this.worldToGrid(ball.pos.x, ball.pos.z);
+
+    let bounced = false;
+
+    for (let x = Math.max(0, gx - 2); x <= Math.min(N - 1, gx + 2); x++) {
+      for (let z = Math.max(0, gz - 2); z <= Math.min(N - 1, gz + 2); z++) {
+        const cellVal = this.grid[x][z];
+        if (cellVal === 1 || cellVal === 2 || cellVal === 3) {
+          const cellCenter = this.gridToWorld(x, z);
+          const closestX = Math.max(cellCenter.x - halfBox, Math.min(ball.pos.x, cellCenter.x + halfBox));
+          const closestZ = Math.max(cellCenter.z - halfBox, Math.min(ball.pos.z, cellCenter.z + halfBox));
+          const dx = ball.pos.x - closestX;
+          const dz = ball.pos.z - closestZ;
+          const dist = Math.hypot(dx, dz);
+
+          if (dist < ball.radius) {
+            let nx = 0;
+            let nz = 0;
+            if (dist > 0.0001) {
+              nx = dx / dist;
+              nz = dz / dist;
+            } else {
+              // Fallback outward normal if ball center ever reached exact box boundary
+              const relX = ball.pos.x - cellCenter.x;
+              const relZ = ball.pos.z - cellCenter.z;
+              if (Math.abs(relX) > Math.abs(relZ)) {
+                nx = relX >= 0 ? 1 : -1;
+              } else {
+                nz = relZ >= 0 ? 1 : -1;
+              }
+            }
+
+            // Push ball cleanly outside the wall box
+            const penetration = (ball.radius - dist) + 0.015;
+            ball.pos.x += nx * penetration;
+            ball.pos.z += nz * penetration;
+
+            // Reflect velocity vector across normal if moving into the wall
+            const dot = ball.vel.x * nx + ball.vel.z * nz;
+            if (dot < 0) {
+              ball.vel.x -= 2 * dot * nx;
+              ball.vel.z -= 2 * dot * nz;
+              this.normalizeBallSpeed(ball);
+              bounced = true;
+            }
+          }
+        }
+      }
+    }
+
+    if (bounced) {
+      const distToPlayer = Math.hypot(ball.pos.x - this.playerPos.x, ball.pos.z - this.playerPos.z);
+      window.soundManager.playBallBounce(distToPlayer);
+    }
+  }
+
+  onPlayerHitByBall() {
+    this.lives = Math.max(0, this.lives - 1);
+    this.invulnTimer = this.cfg.INVULNERABILITY_TIME;
+    window.soundManager.playPlayerHit();
+    this.triggerScreenFlash('rgba(244, 63, 94, 0.55)');
+    this.updateHUD();
+
+    if (this.lives <= 0) {
+      this.state = 'gameover';
+      this.showGameOverModal();
+    } else {
+      this.showToast(`CRUSHED BY GIANT BALL! ${this.lives} ${this.lives === 1 ? 'Life' : 'Lives'} Remaining (3s Phase Shield)`, 'rose');
+    }
+  }
+
+  // Co-Op Partner AI (Assists in Single-Player Co-Op Bot mode or while waiting for Player 2 in Room Xellossan)
+  updateCoopPartner(dt) {
+    if (this.partner.active && !this.partner.isBot) {
+      this.partner.mesh.visible = true;
+      this.partner.mesh.position.set(this.partner.pos.x, 0, this.partner.pos.z);
+      this.partner.mesh.rotation.y = this.partner.yaw;
+      return;
+    }
+
+    if (!this.coopBotEnabled) {
+      if (!this.partner.active) this.partner.mesh.visible = false;
+      return;
+    }
+
+    this.partner.mesh.visible = true;
+    this.partner.buildTimer -= dt;
+
+    let targetBall = this.balls.find(b => !b.trapped);
+    if (targetBall) {
+      const dx = targetBall.pos.x - this.partner.pos.x;
+      const dz = targetBall.pos.z - this.partner.pos.z;
+      const dist = Math.hypot(dx, dz);
+      this.partner.yaw = Math.atan2(-dx, -dz);
+
+      const desiredDist = 7.0;
+      const moveDir = dist > desiredDist ? 1 : -1;
+      const step = 6.5 * dt * moveDir;
+      const nx = this.partner.pos.x + (dx / Math.max(1, dist)) * step;
+      const nz = this.partner.pos.z + (dz / Math.max(1, dist)) * step;
+      if (this.canPlayerStandAt(nx, this.partner.pos.z)) this.partner.pos.x = nx;
+      if (this.canPlayerStandAt(this.partner.pos.x, nz)) this.partner.pos.z = nz;
+
+      if (this.partner.buildTimer <= 0 && dist > 4.5 && dist < 10.0) {
+        this.partner.buildTimer = 1.45;
+        const bx = this.partner.pos.x + (dx / Math.max(1, dist)) * 3.8;
+        const bz = this.partner.pos.z + (dz / Math.max(1, dist)) * 3.8;
+        const { gx, gz } = this.worldToGrid(bx, bz);
+        this.placeBlockAt(gx, gz, true, true);
+      }
+    }
+
+    this.partner.mesh.position.set(this.partner.pos.x, 0, this.partner.pos.z);
+    this.partner.mesh.rotation.y = this.partner.yaw;
+  }
+
+  // Network Synchronization for 2-Player Co-Op
+  handleNetworkMessage(msg) {
+    if (!msg || !msg.type) return;
+
+    if (msg.type === 'HELLO') {
+      this.partner.active = true;
+      this.partner.isBot = false;
+      this.showToast(`Player 2 Connected in Room "${this.roomName}"! Direct Audio & Co-Op Active.`, 'emerald');
+      if (this.networkMode === 'host') {
+        window.networkManager.send({
+          type: 'CONFIG_SYNC',
+          balls: this.configuredBalls,
+          lives: this.configuredLives
+        });
+      }
+    } else if (msg.type === 'CONFIG_SYNC' && this.networkMode === 'client') {
+      this.configuredBalls = msg.balls || this.configuredBalls;
+      this.configuredLives = msg.lives || this.configuredLives;
+      this.lives = this.configuredLives;
+      this.startLevel(this.level);
+    } else if (msg.type === 'PLAYER_STATE') {
+      this.partner.active = true;
+      this.partner.isBot = false;
+      this.partner.pos.set(msg.x, this.cfg.EYE_HEIGHT, msg.z);
+      this.partner.yaw = msg.yaw;
+    } else if (msg.type === 'PLACE_BLOCK') {
+      this.placeBlockAt(msg.gx, msg.gz, true, false);
+    } else if (msg.type === 'REMOVE_BLOCK') {
+      this.removeBlockAt(msg.gx, msg.gz, false);
+    } else if (msg.type === 'BALLS_SYNC' && this.networkMode === 'client') {
+      msg.balls.forEach(bs => {
+        const localBall = this.balls.find(b => b.id === bs.id);
+        if (localBall) {
+          localBall.pos.x = bs.x;
+          localBall.pos.z = bs.z;
+          localBall.vel.x = bs.vx;
+          localBall.vel.z = bs.vz;
+          if (bs.trapped && !localBall.trapped) this.markBallContained(localBall);
+        }
+      });
+    }
+  }
+
+  broadcastNetworkState(dt) {
+    if (this.networkMode === 'single' || !window.networkManager.isConnected) return;
+    this.netSyncTimer += dt;
+    if (this.netSyncTimer < 0.05) return;
+    this.netSyncTimer = 0;
+
+    window.networkManager.send({
+      type: 'PLAYER_STATE',
+      x: this.playerPos.x,
+      z: this.playerPos.z,
+      yaw: this.playerYaw
+    });
+
+    if (this.networkMode === 'host') {
+      window.networkManager.send({
+        type: 'BALLS_SYNC',
+        balls: this.balls.map(b => ({
+          id: b.id,
+          x: b.pos.x,
+          z: b.pos.z,
+          vx: b.vel.x,
+          vz: b.vel.z,
+          trapped: b.trapped
+        }))
+      });
+    }
+  }
+
+  // Render tactical 2D Radar Minimap
+  renderMinimap() {
+    if (!this.minimapCtx) return;
+    const ctx = this.minimapCtx;
+    const W = this.minimapCanvas.width;
+    const H = this.minimapCanvas.height;
+    const N = this.cfg.GRID_SIZE;
+    const cw = W / N;
+    const ch = H / N;
+
+    ctx.clearRect(0, 0, W, H);
+
+    for (let gx = 0; gx < N; gx++) {
+      for (let gz = 0; gz < N; gz++) {
+        const v = this.grid[gx][gz];
+        if (v === 1) {
+          ctx.fillStyle = '#334155';
+        } else if (v === 2) {
+          ctx.fillStyle = '#38bdf8';
+        } else if (v === 3) {
+          ctx.fillStyle = 'rgba(16, 185, 129, 0.55)';
+        } else {
+          ctx.fillStyle = 'rgba(15, 23, 42, 0.75)';
+        }
+        ctx.fillRect(gx * cw, gz * ch, cw - 0.5, ch - 0.5);
+      }
+    }
+
+    if (this.targetCell) {
+      ctx.strokeStyle = this.targetCell.canDelete
+        ? '#f59e0b'
+        : (this.targetCell.valid ? '#38bdf8' : '#f43f5e');
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(this.targetCell.gx * cw, this.targetCell.gz * ch, cw, ch);
+    }
+
+    for (const b of this.balls) {
+      const g = this.worldToGrid(b.pos.x, b.pos.z);
+      ctx.fillStyle = b.trapped ? '#10b981' : '#f43f5e';
+      ctx.beginPath();
+      ctx.arc((g.gx + 0.5) * cw, (g.gz + 0.5) * ch, cw * 0.62, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    if (this.partner.mesh && this.partner.mesh.visible) {
+      const pg = this.worldToGrid(this.partner.pos.x, this.partner.pos.z);
+      ctx.fillStyle = '#10b981';
+      ctx.beginPath();
+      ctx.arc((pg.gx + 0.5) * cw, (pg.gz + 0.5) * ch, cw * 0.55, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    const lg = this.worldToGrid(this.playerPos.x, this.playerPos.z);
+    const px = (lg.gx + 0.5) * cw;
+    const pz = (lg.gz + 0.5) * ch;
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(px, pz, cw * 0.55, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = '#38bdf8';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(px, pz);
+    ctx.lineTo(px - Math.sin(this.playerYaw) * cw * 2.2, pz - Math.cos(this.playerYaw) * ch * 2.2);
+    ctx.stroke();
+  }
+
+  initControls() {
+    window.addEventListener('keydown', (e) => {
+      this.keys[e.code] = true;
+      if (this.state === 'playing') {
+        if (e.code === 'KeyF' || e.code === 'KeyX' || e.code === 'Backspace') {
+          this.tryRemoveBlock();
+        } else if (e.code === 'KeyR') {
+          this.buildRange = (this.buildRange % this.cfg.MAX_BUILD_RANGE) + 1;
+          this.updateHUD();
+        } else if (e.code === 'KeyM') {
+          window.soundManager.toggleMicMute();
+        }
+      } else if (this.state === 'gameover' || this.state === 'levelclear') {
+        if (e.code === 'Space' || e.code === 'Enter') {
+          this.triggerModalPrimaryAction();
+        }
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      this.keys[e.code] = false;
+    });
+
+    const domEl = this.renderer.domElement;
+
+    domEl.addEventListener('mousedown', (e) => {
+      window.soundManager.initContext();
+
+      // Allow clicking the 3D in-world Restart / Next-Wave button directly with the mouse
+      if (this.state === 'gameover' || this.state === 'levelclear') {
+        const rect = domEl.getBoundingClientRect();
+        const mouse = new THREE.Vector2(
+          ((e.clientX - rect.left) / rect.width) * 2 - 1,
+          -((e.clientY - rect.top) / rect.height) * 2 + 1
+        );
+        this.raycaster.setFromCamera(mouse, this.camera);
+        const hits = this.raycaster.intersectObjects([this.vrRestartButtonMesh, this.vrPanelMesh], false);
+        if (hits.length > 0) {
+          this.triggerModalPrimaryAction();
+          return;
+        }
+      }
+
+      if (this.state !== 'playing') return;
+
+      if (this.displayMode === 'desktop' && !this.pointerLocked) {
+        if (domEl.requestPointerLock) {
+          try { domEl.requestPointerLock(); } catch (err) {}
+        }
+      }
+
+      if (e.button === 0) {
+        this.mouseButtons.left = true;
+        this.isDraggingLook = true;
+        this.lastMouseX = e.clientX;
+        this.lastMouseY = e.clientY;
+        this.tryPlaceBlock();
+      } else if (e.button === 2) {
+        this.mouseButtons.right = true;
+        this.tryRemoveBlock();
+      }
+    });
+
+    window.addEventListener('mouseup', (e) => {
+      if (e.button === 0) {
+        this.mouseButtons.left = false;
+        this.isDraggingLook = false;
+      } else if (e.button === 2) {
+        this.mouseButtons.right = false;
+      }
+    });
+
+    window.addEventListener('contextmenu', (e) => {
+      if (this.state === 'playing') e.preventDefault();
+    });
+
+    document.addEventListener('pointerlockchange', () => {
+      this.pointerLocked = document.pointerLockElement === domEl;
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (this.state !== 'playing') return;
+      if (this.pointerLocked) {
+        this.playerYaw -= e.movementX * this.cfg.DESKTOP_MOUSE_SENS;
+        this.playerPitch = Math.max(-1.1, Math.min(1.1, this.playerPitch - e.movementY * this.cfg.DESKTOP_MOUSE_SENS));
+      } else if (this.isDraggingLook || e.buttons === 1) {
+        const dx = e.clientX - this.lastMouseX;
+        const dy = e.clientY - this.lastMouseY;
+        this.lastMouseX = e.clientX;
+        this.lastMouseY = e.clientY;
+        this.playerYaw -= dx * 0.005;
+        this.playerPitch = Math.max(-1.1, Math.min(1.1, this.playerPitch - dy * 0.005));
+      }
+    });
+
+    window.addEventListener('wheel', (e) => {
+      if (this.state !== 'playing') return;
+      if (e.deltaY < 0) {
+        this.buildRange = Math.min(this.cfg.MAX_BUILD_RANGE, this.buildRange + 1);
+      } else {
+        this.buildRange = Math.max(this.cfg.MIN_BUILD_RANGE, this.buildRange - 1);
+      }
+      this.updateHUD();
+    });
+  }
+
+  async checkWebXRSupport() {
+    const statusBadge = document.getElementById('xr-support-badge');
+    if ('xr' in navigator && navigator.xr && navigator.xr.isSessionSupported) {
+      try {
+        this.xrSupported = await navigator.xr.isSessionSupported('immersive-vr');
+      } catch (e) {
+        this.xrSupported = false;
+      }
+    }
+    if (statusBadge) {
+      if (this.xrSupported) {
+        statusBadge.textContent = 'Meta Quest WebXR Ready';
+        statusBadge.className = 'px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-400/40';
+      } else {
+        statusBadge.textContent = 'Desktop Browser / WebXR Sim Ready';
+        statusBadge.className = 'px-2.5 py-0.5 rounded-full text-xs font-semibold bg-sky-500/20 text-sky-300 border border-sky-400/40';
+      }
+    }
+  }
+
+  async enterVRSessionIfRequested() {
+    const vrBanner = document.getElementById('vr-mode-banner');
+    if (this.displayMode !== 'vr') {
+      if (vrBanner) vrBanner.classList.add('hidden');
+      return;
+    }
+
+    if (vrBanner) vrBanner.classList.remove('hidden');
+
+    if (navigator.xr && navigator.xr.requestSession) {
+      try {
+        const session = await navigator.xr.requestSession('immersive-vr', {
+          optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking']
+        });
+        this.xrSession = session;
+        await this.renderer.xr.setSession(session);
+        session.addEventListener('end', () => {
+          this.xrSession = null;
+        });
+        this.showToast('Oculus Quest VR Active! Right Trigger: Place Block | Left Trigger: Delete Block', 'cyan');
+      } catch (err) {
+        this.showToast('VR Mode Selected (Headset Standby — Using VR Rig & Trigger Controls)', 'cyan');
+      }
+    } else {
+      this.showToast('VR Mode Active (Open on Meta Quest Browser over HTTPS for Native Headset Stereo)', 'cyan');
+    }
+  }
+
+  selectDisplayMode(mode) {
+    this.displayMode = mode;
+    const btnDesktop = document.getElementById('mode-btn-desktop');
+    const btnVR = document.getElementById('mode-btn-vr');
+    const modeDesc = document.getElementById('selected-mode-summary');
+
+    if (btnDesktop && btnVR) {
+      btnDesktop.classList.toggle('active', mode === 'desktop');
+      btnVR.classList.toggle('active', mode === 'vr');
+    }
+    if (modeDesc) {
+      modeDesc.textContent = mode === 'vr'
+        ? 'Launching in Oculus Quest VR (WebXR): Left Stick = Move/Strafe, Right Stick = Rotate, Right Trigger = Place Block, Left Trigger = Delete Block.'
+        : 'Launching in Desktop Browser Mode: WASD = Move/Strafe, Mouse = Rotate, Left Click / Space = Place Block, Right Click / F = Delete Block.';
+    }
+  }
+
+  readPreGameSettingsFromUI() {
+    const ballInp = document.getElementById('input-ball-count');
+    const lifeInp = document.getElementById('input-life-count');
+    if (ballInp) {
+      const bVal = parseInt(ballInp.value, 10);
+      if (!isNaN(bVal)) {
+        this.configuredBalls = Math.max(this.cfg.MIN_BALL_COUNT, Math.min(this.cfg.MAX_BALL_COUNT, bVal));
+      }
+    }
+    if (lifeInp) {
+      const lVal = parseInt(lifeInp.value, 10);
+      if (!isNaN(lVal)) {
+        this.configuredLives = Math.max(this.cfg.MIN_LIVES, Math.min(this.cfg.MAX_LIVES, lVal));
+      }
+    }
+  }
+
+  async launchGame(networkMode) {
+    window.soundManager.initContext();
+    this.readPreGameSettingsFromUI();
+    this.networkMode = networkMode;
+
+    const roomInput = document.getElementById('room-name-input');
+    this.roomName = (roomInput && roomInput.value.trim()) ? roomInput.value.trim() : this.cfg.DEFAULT_ROOM_NAME;
+
+    if (networkMode === 'host') {
+      await window.networkManager.hostRoom(this.roomName, (data) => this.handleNetworkMessage(data));
+    } else if (networkMode === 'client') {
+      await window.networkManager.joinRoom(this.roomName, (data) => this.handleNetworkMessage(data));
+    } else {
+      window.networkManager.disconnect();
+      window.networkManager.updateStatus('Single Player Arena', false);
+    }
+
+    document.getElementById('lobby-modal').classList.add('hidden');
+    document.getElementById('hud-overlay').classList.remove('hidden');
+    document.getElementById('modal-level-clear').classList.add('hidden');
+    document.getElementById('modal-game-over').classList.add('hidden');
+    this.vrMenuGroup.visible = false;
+
+    this.level = 1;
+    this.score = 0;
+    this.lives = this.configuredLives;
+    this.startLevel(1);
+
+    await this.enterVRSessionIfRequested();
+  }
+
+  startLevel(lvl) {
+    this.level = lvl;
+    this.state = 'playing';
+    this.vrMenuGroup.visible = false;
+    this.playerPos.set(0, this.cfg.EYE_HEIGHT, 16);
+    this.playerYaw = 0;
+    this.playerPitch = 0;
+    this.invulnTimer = 2.0;
+
+    this.resetGridAndWalls();
+    this.spawnBallsForLevel(lvl);
+
+    this.updateHUD();
+    this.showToast(`Level ${lvl} Started — ${this.balls.length} Balls Active | ${this.lives} Lives`, 'cyan');
+  }
+
+  updateHUD() {
+    const setEl = (id, val) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = val;
+    };
+
+    const untrapped = this.balls.filter(b => !b.trapped).length;
+    const totalBalls = this.balls.length;
+
+    setEl('hud-level', this.level);
+    setEl('hud-score', this.score.toLocaleString());
+    setEl('hud-lives', '♥'.repeat(Math.max(0, this.lives)) || '0');
+    setEl('hud-capture', `${this.capturedPct}% / ${this.cfg.TARGET_CAPTURE_PCT}%`);
+    setEl('hud-balls', `${totalBalls - untrapped} / ${totalBalls} Trapped`);
+    setEl('hud-range', `${this.buildRange * 2}m`);
+    setEl('hud-room-label', this.networkMode === 'single' ? 'Solo Mode' : `Room: ${this.roomName}`);
+
+    const bar = document.getElementById('hud-capture-bar');
+    if (bar) {
+      const w = Math.min(100, Math.round((this.capturedPct / this.cfg.TARGET_CAPTURE_PCT) * 100));
+      bar.style.width = `${w}%`;
+    }
+
+    this.render3DVRHudTexture();
+  }
+
+  updateStatusIndicators() {
+    const container = document.getElementById('hud-active-buffs');
+    if (container) {
+      if (this.invulnTimer > 0) {
+        container.innerHTML = `<span class="px-2.5 py-1 rounded-full text-xs font-semibold border bg-rose-500/30 border-rose-400 text-rose-200">Phase Shield ${this.invulnTimer.toFixed(1)}s</span>`;
+      } else {
+        container.innerHTML = '';
+      }
+    }
+
+    const micBar = document.getElementById('mic-level-bar');
+    if (micBar) {
+      micBar.style.width = `${window.soundManager.getMicLevel()}%`;
+    }
+  }
+
+  triggerScreenFlash(colorCss) {
+    const el = document.getElementById('screen-flash');
+    if (!el) return;
+    el.style.background = `radial-gradient(circle, transparent 40%, ${colorCss} 100%)`;
+    el.style.opacity = '1';
+    setTimeout(() => {
+      el.style.opacity = '0';
+    }, 260);
+  }
+
+  showToast(message, color = 'cyan') {
+    const box = document.getElementById('hud-toast');
+    if (!box) return;
+    box.textContent = message;
+    const palette = {
+      cyan: 'border-sky-400/60 text-sky-200 bg-slate-900/90',
+      emerald: 'border-emerald-400/60 text-emerald-200 bg-slate-900/90',
+      rose: 'border-rose-400/60 text-rose-200 bg-slate-900/90',
+      amber: 'border-amber-400/60 text-amber-200 bg-slate-900/90'
+    };
+    box.className = `px-4 py-2 rounded-xl border text-xs md:text-sm font-semibold shadow-lg transition-opacity duration-300 ${palette[color] || palette.cyan}`;
+    box.style.opacity = '1';
+    clearTimeout(this._toastTimer);
+    this._toastTimer = setTimeout(() => {
+      box.style.opacity = '0';
+    }, 3000);
+  }
+
+  showLevelClearModal() {
+    if (document.pointerLockElement) {
+      try { document.exitPointerLock(); } catch (e) {}
+    }
+    // Show both the 3D in-world clickable button (for VR & 3D scene) and the HTML modal (for Desktop)
+    this.show3DVRModal('levelclear', false);
+
+    const modal = document.getElementById('modal-level-clear');
+    const summary = document.getElementById('level-clear-summary');
+    if (summary) {
+      summary.textContent = `Arena Sector ${this.level} Secured! Captured ${this.capturedPct}% of the arena floor. Total Score: ${this.score.toLocaleString()}`;
+    }
+    if (modal && !this.renderer.xr.isPresenting) {
+      modal.classList.remove('hidden');
+    }
+  }
+
+  showGameOverModal() {
+    if (document.pointerLockElement) {
+      try { document.exitPointerLock(); } catch (e) {}
+    }
+    // Always spawn the 3D clickable Restart Button in front of the player so VR users can click it to restart!
+    this.show3DVRModal('gameover', false);
+
+    const modal = document.getElementById('modal-game-over');
+    const summary = document.getElementById('game-over-summary');
+    if (summary) {
+      summary.textContent = `You reached Sector Level ${this.level} with a final score of ${this.score.toLocaleString()}. Click Restart below or click the 3D Restart button in VR!`;
+    }
+    if (modal && !this.renderer.xr.isPresenting) {
+      modal.classList.remove('hidden');
+    }
+  }
+
+  bindUIEvents() {
+    const bindClick = (id, fn) => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('click', fn);
+    };
+
+    bindClick('mode-btn-desktop', () => this.selectDisplayMode('desktop'));
+    bindClick('mode-btn-vr', () => this.selectDisplayMode('vr'));
+
+    // Pre-game Ball Count & Life Count steppers on Start Screen
+    const updateSteppers = (inputId, delta, minVal, maxVal) => {
+      const inp = document.getElementById(inputId);
+      if (!inp) return;
+      const cur = parseInt(inp.value, 10) || 3;
+      const next = Math.max(minVal, Math.min(maxVal, cur + delta));
+      inp.value = next;
+      this.readPreGameSettingsFromUI();
+    };
+
+    bindClick('btn-balls-minus', () => updateSteppers('input-ball-count', -1, this.cfg.MIN_BALL_COUNT, this.cfg.MAX_BALL_COUNT));
+    bindClick('btn-balls-plus', () => updateSteppers('input-ball-count', 1, this.cfg.MIN_BALL_COUNT, this.cfg.MAX_BALL_COUNT));
+    bindClick('btn-lives-minus', () => updateSteppers('input-life-count', -1, this.cfg.MIN_LIVES, this.cfg.MAX_LIVES));
+    bindClick('btn-lives-plus', () => updateSteppers('input-life-count', 1, this.cfg.MIN_LIVES, this.cfg.MAX_LIVES));
+
+    const ballInp = document.getElementById('input-ball-count');
+    if (ballInp) ballInp.addEventListener('change', () => this.readPreGameSettingsFromUI());
+    const lifeInp = document.getElementById('input-life-count');
+    if (lifeInp) lifeInp.addEventListener('change', () => this.readPreGameSettingsFromUI());
+
+    bindClick('btn-start-single', () => this.launchGame('single'));
+    bindClick('btn-host-room', () => this.launchGame('host'));
+    bindClick('btn-join-room', () => this.launchGame('client'));
+
+    bindClick('btn-reset-room-default', () => {
+      const inp = document.getElementById('room-name-input');
+      if (inp) inp.value = this.cfg.DEFAULT_ROOM_NAME;
+    });
+
+    bindClick('btn-toggle-mic', () => {
+      window.soundManager.toggleMicMute();
+    });
+
+    bindClick('btn-toggle-sfx', () => {
+      const muted = window.soundManager.toggleSfxMute();
+      const btn = document.getElementById('btn-toggle-sfx');
+      if (btn) btn.textContent = muted ? 'SFX: Muted' : 'SFX: On';
+    });
+
+    bindClick('btn-toggle-bot', () => {
+      this.coopBotEnabled = !this.coopBotEnabled;
+      const btn = document.getElementById('btn-toggle-bot');
+      if (btn) {
+        btn.textContent = this.coopBotEnabled ? 'Co-Op Bot: Active' : 'Co-Op Bot: Off';
+        btn.className = this.coopBotEnabled
+          ? 'px-2.5 py-1 rounded-lg bg-emerald-500/20 border border-emerald-400/50 text-emerald-200 text-xs font-semibold hover:bg-emerald-500/30 transition'
+          : 'px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-600 text-slate-300 text-xs font-semibold hover:bg-slate-700 transition';
+      }
+      this.showToast(
+        this.coopBotEnabled
+          ? 'Co-Op Partner Bot Activated — Assisting with Wall Boxing!'
+          : 'Co-Op Partner Bot Deactivated',
+        'emerald'
+      );
+    });
+
+    bindClick('btn-hud-build', () => this.tryPlaceBlock());
+    bindClick('btn-hud-delete', () => this.tryRemoveBlock());
+    bindClick('btn-enter-webxr-now', () => {
+      this.displayMode = 'vr';
+      this.enterVRSessionIfRequested();
+    });
+
+    bindClick('btn-return-lobby', () => {
+      if (document.pointerLockElement) {
+        try { document.exitPointerLock(); } catch (e) {}
+      }
+      this.state = 'lobby';
+      this.vrMenuGroup.visible = false;
+      document.getElementById('hud-overlay').classList.add('hidden');
+      document.getElementById('lobby-modal').classList.remove('hidden');
+      document.getElementById('modal-level-clear').classList.add('hidden');
+      document.getElementById('modal-game-over').classList.add('hidden');
+    });
+
+    bindClick('btn-next-level', () => {
+      document.getElementById('modal-level-clear').classList.add('hidden');
+      this.vrMenuGroup.visible = false;
+      this.startLevel(this.level + 1);
+    });
+
+    bindClick('btn-restart-game', () => {
+      this.restartGameSession();
+    });
+
+    bindClick('btn-gameover-lobby', () => {
+      this.vrMenuGroup.visible = false;
+      document.getElementById('modal-game-over').classList.add('hidden');
+      document.getElementById('hud-overlay').classList.add('hidden');
+      document.getElementById('lobby-modal').classList.remove('hidden');
+      this.state = 'lobby';
+    });
+
+    const volSlider = document.getElementById('voice-volume-slider');
+    if (volSlider) {
+      volSlider.addEventListener('input', (e) => {
+        window.soundManager.setRemoteVolume(e.target.value);
+      });
+    }
+  }
+
+  startRenderLoop() {
+    this.renderer.setAnimationLoop(() => {
+      const dt = Math.min(0.1, this.clock.getDelta());
+
+      if (this.state === 'playing') {
+        if (this.buildCooldownTimer > 0) {
+          this.buildCooldownTimer = Math.max(0, this.buildCooldownTimer - dt);
+        }
+        if (this.deleteCooldownTimer > 0) {
+          this.deleteCooldownTimer = Math.max(0, this.deleteCooldownTimer - dt);
+        }
+        if (this.invulnTimer > 0) {
+          this.invulnTimer = Math.max(0, this.invulnTimer - dt);
+        }
+
+        this.updatePlayerMovement(dt);
+        this.updateTargetCell();
+        this.updateBallsPhysics(dt);
+        this.updateCoopPartner(dt);
+        this.broadcastNetworkState(dt);
+        this.updateStatusIndicators();
+        this.renderMinimap();
+      } else if (this.state === 'gameover' || this.state === 'levelclear') {
+        // Poll VR controllers so player can pull either Trigger on the 3D Restart button inside VR!
+        if (this.renderer.xr.isPresenting) {
+          this.pollVRControllers();
+          // Hover highlight check on the 3D button
+          const origin = new THREE.Vector3();
+          const quat = new THREE.Quaternion();
+          const dir = new THREE.Vector3(0, 0, -1);
+          this.vrControllerRight.getWorldPosition(origin);
+          this.vrControllerRight.getWorldQuaternion(quat);
+          dir.applyQuaternion(quat);
+          this.raycaster.set(origin, dir);
+          const hits = this.raycaster.intersectObject(this.vrRestartButtonMesh, false);
+          this.draw3DVRModalTextures(this.state, hits.length > 0);
+        }
+      } else {
+        // Subtle idle camera orbit while in lobby
+        const t = performance.now() * 0.00025;
+        this.cameraRig.position.set(Math.sin(t) * 14, 6, Math.cos(t) * 14);
+        this.camera.rotation.set(-0.35, t + Math.PI, 0);
+      }
+
+      this.renderer.render(this.scene, this.camera);
+    });
+  }
+}
+
+window.addEventListener('load', () => {
+  window.entrapGame = new EntrapBallGame();
+});

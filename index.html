@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>EntrapBall VR — Oculus Quest &amp; Browser Co-Op Arena (Moraff's Entrap + JezzBall)</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body class="bg-slate-950 text-slate-100 antialiased selection:bg-sky-500 selection:text-white">
+
+  <!-- 3D WebGL / WebXR Viewport Container -->
+  <div id="canvas-container"></div>
+
+  <!-- Damage Screen Vignette Flash -->
+  <div id="screen-flash"></div>
+
+  <!-- Hidden WebRTC Remote Audio Element for Direct P2P Voice Chat -->
+  <audio id="remote-peer-audio" autoplay playsinline class="hidden"></audio>
+
+  <!-- ==================== START LOBBY OVERLAY ==================== -->
+  <div id="lobby-modal" class="fixed inset-0 z-30 flex items-center justify-center p-3 md:p-6 bg-slate-950/80 backdrop-blur-md overflow-y-auto">
+    <div class="glass-panel rounded-2xl max-w-4xl w-full p-5 md:p-8 max-h-[94vh] overflow-y-auto custom-scroll">
+
+      <!-- Header Banner -->
+      <div class="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-700/70">
+        <div>
+          <div class="flex items-center gap-2.5">
+            <span class="px-2.5 py-0.5 rounded-md bg-sky-500/20 border border-sky-400/40 text-sky-300 text-xs font-bold uppercase tracking-wider">WebXR + Desktop FPS</span>
+            <span id="xr-support-badge" class="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-sky-500/20 text-sky-300 border border-sky-400/40">Checking WebXR...</span>
+          </div>
+          <h1 class="text-2xl md:text-4xl font-extrabold tracking-tight mt-1 bg-gradient-to-r from-sky-400 via-emerald-300 to-purple-400 bg-clip-text text-transparent">
+            ENTRAPBALL VR: CO-OP CONTAINMENT
+          </h1>
+          <p class="text-xs md:text-sm text-slate-300 mt-0.5">
+            First-Person 3D fusion of <strong class="text-sky-300">Moraff's Entrap</strong> &amp; <strong class="text-emerald-300">JezzBall</strong> — Build walls to trap giant kinetic spheres, and delete blocks with your other trigger so you never get trapped!
+          </p>
+        </div>
+      </div>
+
+      <!-- STEP 1: Select VR vs Desktop Mode Before Starting or Joining -->
+      <div class="mt-4">
+        <label class="block text-xs font-bold uppercase tracking-wider text-sky-300 mb-2">
+          1. Select Display &amp; Control Mode (Before Starting or Joining)
+        </label>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <button type="button" id="mode-btn-desktop" class="mode-card active text-left p-3.5 rounded-xl border border-slate-700 bg-slate-900/70">
+            <div class="flex items-center justify-between">
+              <span class="text-base font-bold text-white">Desktop Browser Mode</span>
+              <span class="text-xs px-2 py-0.5 rounded bg-sky-500/20 text-sky-300 font-semibold">WASD + Mouse</span>
+            </div>
+            <p class="text-xs text-slate-300 mt-1.5 leading-relaxed">
+              Move with <strong>WASD</strong>, rotate with <strong>Mouse</strong>, <strong>Left-Click / Space</strong> to place a block, and <strong>Right-Click / F</strong> to delete a single block.
+            </p>
+          </button>
+
+          <button type="button" id="mode-btn-vr" class="mode-card text-left p-3.5 rounded-xl border border-slate-700 bg-slate-900/70">
+            <div class="flex items-center justify-between">
+              <span class="text-base font-bold text-white">Oculus Quest VR Mode (WebXR)</span>
+              <span class="text-xs px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-semibold">Quest Controllers</span>
+            </div>
+            <p class="text-xs text-slate-300 mt-1.5 leading-relaxed">
+              <strong>Left Stick</strong> moves forward/back/left/right. <strong>Right Stick</strong> rotates character. <strong>Right Trigger</strong> places block; <strong>Left Trigger</strong> deletes a block.
+            </p>
+          </button>
+        </div>
+        <p id="selected-mode-summary" class="text-xs text-sky-200/90 mt-2 bg-slate-900/80 px-3 py-2 rounded-lg border border-slate-800">
+          Launching in Desktop Browser Mode: WASD = Move/Strafe, Mouse = Rotate, Left Click / Space = Place Block, Right Click / F = Delete Block.
+        </p>
+      </div>
+
+      <!-- STEP 2: Select Number of Balls & Number of Lives Before Starting -->
+      <div class="mt-4 bg-slate-900/75 border border-slate-800 rounded-xl p-4">
+        <label class="block text-xs font-bold uppercase tracking-wider text-amber-300 mb-2.5">
+          2. Arena Match Settings (Select Balls &amp; Lives Before Starting)
+        </label>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <!-- Number of Balls Selector -->
+          <div class="flex items-center justify-between bg-slate-950/80 border border-slate-800 rounded-lg px-3.5 py-2.5">
+            <div>
+              <div class="text-sm font-bold text-white">Starting Balls</div>
+              <div class="text-[11px] text-slate-400">Giant bouncing spheres in arena (1–10)</div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button type="button" id="btn-balls-minus" class="w-8 h-8 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold text-base border border-slate-600 flex items-center justify-center">−</button>
+              <input id="input-ball-count" type="number" min="1" max="10" value="3" class="w-14 text-center py-1 rounded bg-slate-900 border border-sky-500/40 text-sky-300 font-extrabold text-base" />
+              <button type="button" id="btn-balls-plus" class="w-8 h-8 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold text-base border border-slate-600 flex items-center justify-center">+</button>
+            </div>
+          </div>
+
+          <!-- Number of Lives Selector -->
+          <div class="flex items-center justify-between bg-slate-950/80 border border-slate-800 rounded-lg px-3.5 py-2.5">
+            <div>
+              <div class="text-sm font-bold text-white">Player Lives</div>
+              <div class="text-[11px] text-slate-400">Hits before Game Over &amp; Restart (1–10)</div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button type="button" id="btn-lives-minus" class="w-8 h-8 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold text-base border border-slate-600 flex items-center justify-center">−</button>
+              <input id="input-life-count" type="number" min="1" max="10" value="3" class="w-14 text-center py-1 rounded bg-slate-900 border border-rose-500/40 text-rose-300 font-extrabold text-base" />
+              <button type="button" id="btn-lives-plus" class="w-8 h-8 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold text-base border border-slate-600 flex items-center justify-center">+</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- STEP 3: Room Configuration & Launch Options (Single Player, Host Room, Join Room) -->
+      <div class="mt-4 grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
+        <!-- Left Column: P2P Room Setup + Launch Buttons -->
+        <div class="lg:col-span-7 bg-slate-900/75 border border-slate-800 rounded-xl p-4 flex flex-col justify-between">
+          <div>
+            <label for="room-name-input" class="block text-xs font-bold uppercase tracking-wider text-emerald-300 mb-1.5">
+              3. Peer-to-Peer Room Name (2-Player Co-Op + Direct Voice Chat)
+            </label>
+            <div class="flex gap-2">
+              <input
+                id="room-name-input"
+                type="text"
+                value="Xellossan"
+                placeholder="Enter Room Name (Default: Xellossan)"
+                class="w-full px-3.5 py-2 rounded-lg bg-slate-950 border border-sky-500/40 text-white font-semibold text-sm focus:outline-none focus:border-sky-400"
+              />
+              <button
+                type="button"
+                id="btn-reset-room-default"
+                class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 shrink-0"
+              >
+                Reset "Xellossan"
+              </button>
+            </div>
+            <p id="lobby-net-status" class="text-xs text-slate-400 mt-1.5">
+              Default room is set to <strong class="text-white">Xellossan</strong>. WebRTC Direct Audio Chat activates automatically when hosting or joining.
+            </p>
+          </div>
+
+          <div class="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+            <button
+              type="button"
+              id="btn-start-single"
+              class="py-3 px-4 rounded-xl bg-gradient-to-r from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500 text-white font-bold text-sm shadow-lg shadow-sky-500/20 transition"
+            >
+              Play Single Player
+            </button>
+
+            <button
+              type="button"
+              id="btn-host-room"
+              class="py-3 px-4 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white font-bold text-sm shadow-lg shadow-emerald-500/20 transition"
+            >
+              Create / Host Room
+            </button>
+
+            <button
+              type="button"
+              id="btn-join-room"
+              class="py-3 px-4 rounded-xl bg-gradient-to-r from-purple-500 to-indigo-600 hover:from-purple-400 hover:to-indigo-500 text-white font-bold text-sm shadow-lg shadow-purple-500/20 transition"
+            >
+              Join Room (Player 2)
+            </button>
+          </div>
+        </div>
+
+        <!-- Right Column: Game Mechanics Guide -->
+        <div class="lg:col-span-5 bg-slate-900/75 border border-slate-800 rounded-xl p-4 text-xs space-y-2">
+          <div class="font-bold uppercase tracking-wider text-sky-300">Core Arena Rules</div>
+          <ul class="space-y-1.5 text-slate-300">
+            <li><strong class="text-sky-300">Build &amp; Delete Blocks:</strong> Place blocks one at a time with <strong>Right Trigger</strong> (Click/Space). Pull the <strong>Left Trigger</strong> (Right-Click/F) to delete a single block if you ever wall yourself in.</li>
+            <li><strong class="text-amber-300">Ball Safety Lock:</strong> You cannot spawn a block directly on top of a moving ball (reticle turns red when a ball is in the way).</li>
+            <li><strong class="text-emerald-300">JezzBall + Entrap Capture:</strong> Sealing empty sub-zones captures floor tiles. Boxing a ball into a tight compartment (≤9 cells) contains it!</li>
+            <li><strong class="text-rose-300">3D In-VR Restart Button:</strong> When you lose all lives, a clickable 3D button appears right in front of you in VR space so you can pull the trigger to restart immediately.</li>
+          </ul>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ==================== IN-GAME HUD OVERLAY ==================== -->
+  <div id="hud-overlay" class="hidden fixed inset-0 pointer-events-none z-20 flex flex-col justify-between p-3 md:p-5">
+
+    <!-- Center Crosshair Reticle -->
+    <div id="crosshair">
+      <div class="reticle-ring"></div>
+      <div class="reticle-dot"></div>
+    </div>
+
+    <!-- Top Row: Stats Bar, Capture Progress, Voice & Network Controls -->
+    <div class="flex flex-wrap items-start justify-between gap-3">
+
+      <!-- Left HUD: Lives, Level, Score, Arena Capture Progress -->
+      <div class="glass-panel rounded-xl p-3 pointer-events-auto flex flex-wrap items-center gap-4">
+        <div>
+          <div class="text-[10px] uppercase tracking-wider text-slate-400">Sector</div>
+          <div class="text-lg font-extrabold text-sky-300">LVL <span id="hud-level">1</span></div>
+        </div>
+        <div>
+          <div class="text-[10px] uppercase tracking-wider text-slate-400">Lives</div>
+          <div id="hud-lives" class="text-lg font-extrabold text-rose-400 tracking-widest">♥♥♥</div>
+        </div>
+        <div>
+          <div class="text-[10px] uppercase tracking-wider text-slate-400">Balls Contained</div>
+          <div id="hud-balls" class="text-sm font-bold text-emerald-300">0 / 3 Trapped</div>
+        </div>
+        <div class="min-w-[140px]">
+          <div class="flex justify-between text-[10px] uppercase tracking-wider text-slate-300 mb-1">
+            <span>Captured</span>
+            <span id="hud-capture" class="font-bold text-emerald-300">0% / 75%</span>
+          </div>
+          <div class="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+            <div id="hud-capture-bar" class="h-full bg-gradient-to-r from-sky-400 to-emerald-400 transition-all duration-200" style="width: 0%"></div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[10px] uppercase tracking-wider text-slate-400">Score</div>
+          <div id="hud-score" class="text-base font-extrabold text-amber-300">0</div>
+        </div>
+      </div>
+
+      <!-- Center Toast Notification & Phase Shield Indicator -->
+      <div class="flex flex-col items-center gap-2">
+        <div id="hud-toast" style="opacity: 0;" class="px-4 py-2 rounded-xl border border-sky-400/60 text-sky-200 bg-slate-900/90 text-xs md:text-sm font-semibold shadow-lg transition-opacity duration-300">
+          Arena Initialized
+        </div>
+        <div id="hud-active-buffs" class="flex flex-wrap gap-1.5 justify-center"></div>
+      </div>
+
+      <!-- Right HUD: Direct P2P Audio Chat + Co-Op Status + Lobby Button -->
+      <div class="glass-panel rounded-xl p-3 pointer-events-auto flex flex-col gap-2 min-w-[250px]">
+        <div class="flex items-center justify-between gap-2">
+          <span id="hud-room-label" class="text-xs font-bold text-white">Room: Xellossan</span>
+          <span id="hud-net-status" class="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-sky-500/20 text-sky-300 border border-sky-400/40">
+            Single Player
+          </span>
+        </div>
+
+        <!-- Direct Audio Chat Bar -->
+        <div class="flex items-center justify-between gap-2 bg-slate-900/90 px-2.5 py-1.5 rounded-lg border border-slate-800">
+          <div class="flex items-center gap-1.5">
+            <span id="voice-status-dot" class="w-2 h-2 rounded-full bg-amber-400"></span>
+            <span id="voice-status-text" class="text-[11px] text-slate-300 truncate max-w-[130px]">Mic Standby</span>
+          </div>
+          <div class="w-12 h-1.5 bg-slate-800 rounded-full overflow-hidden" title="Mic Input Level">
+            <div id="mic-level-bar" class="h-full bg-emerald-400 transition-all duration-75" style="width: 0%"></div>
+          </div>
+          <label class="flex items-center gap-1 text-[10px] text-slate-400" title="Partner Voice Volume">
+            <span>Vol</span>
+            <input id="voice-volume-slider" type="range" min="0" max="1" step="0.05" value="1" class="w-12 accent-sky-400 cursor-pointer" />
+          </label>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-1.5">
+          <button type="button" id="btn-toggle-mic" class="px-2.5 py-1 rounded-lg bg-emerald-500/20 border border-emerald-400/50 text-emerald-200 text-xs font-semibold flex items-center gap-1 hover:bg-emerald-500/30 transition">
+            <span id="mic-btn-label">Mic Live (M)</span>
+          </button>
+          <button type="button" id="btn-toggle-sfx" class="px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-600 text-slate-200 text-xs font-semibold hover:bg-slate-700 transition">
+            SFX: On
+          </button>
+          <button type="button" id="btn-toggle-bot" class="px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-600 text-slate-300 text-xs font-semibold hover:bg-slate-700 transition">
+            Co-Op Bot: Off
+          </button>
+          <button type="button" id="btn-return-lobby" class="px-2.5 py-1 rounded-lg bg-rose-500/20 border border-rose-400/40 text-rose-200 text-xs font-semibold hover:bg-rose-500/30 transition ml-auto">
+            Menu
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bottom Row: Radar Minimap + Quick Action Controls + VR Headset Trigger -->
+    <div class="flex flex-wrap items-end justify-between gap-3">
+
+      <!-- Left Bottom: 2D Tactical Arena Minimap -->
+      <div class="glass-panel rounded-xl p-2.5 pointer-events-auto flex items-center gap-3">
+        <canvas id="minimap-canvas" width="132" height="132"></canvas>
+        <div class="text-xs space-y-1 pr-1">
+          <div class="font-bold text-sky-300">Tactical Radar</div>
+          <div class="text-[11px] text-slate-300">Build Dist: <strong id="hud-range" class="text-sky-300">4m</strong> <span class="text-slate-400">(R/Scroll)</span></div>
+          <div class="flex gap-1.5 pt-1">
+            <button type="button" id="btn-hud-build" class="px-2.5 py-1 rounded bg-sky-500/30 border border-sky-400/50 text-sky-200 font-semibold text-[11px] hover:bg-sky-500/40">
+              Place Wall (Click / R-Trig)
+            </button>
+            <button type="button" id="btn-hud-delete" class="px-2.5 py-1 rounded bg-amber-500/30 border border-amber-400/50 text-amber-200 font-semibold text-[11px] hover:bg-amber-500/40">
+              Delete Wall (R-Click / L-Trig)
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right Bottom: VR Headset Quick-Enter Banner & Controls Reminder -->
+      <div class="glass-panel rounded-xl p-3 pointer-events-auto flex flex-col gap-1.5 max-w-md">
+        <div id="vr-mode-banner" class="hidden flex items-center justify-between gap-2 pb-1.5 border-b border-slate-700">
+          <span class="text-xs font-bold text-emerald-300">Oculus Quest VR Mode Enabled</span>
+          <button type="button" id="btn-enter-webxr-now" class="px-2.5 py-1 rounded bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs transition">
+            Enter VR Headset
+          </button>
+        </div>
+        <div class="text-[11px] text-slate-300 leading-snug">
+          <strong class="text-sky-300">Desktop:</strong> WASD Move | Mouse / Q-E Rotate | Left-Click / Space Place Block | Right-Click / F Delete Block<br/>
+          <strong class="text-emerald-300">Oculus Quest VR:</strong> Left Stick Move | Right Stick Rotate | Right Trigger Place Block | Left Trigger Delete Block
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ==================== LEVEL CLEAR MODAL ==================== -->
+  <div id="modal-level-clear" class="hidden fixed inset-0 z-40 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+    <div class="glass-panel rounded-2xl max-w-md w-full p-6 text-center space-y-4">
+      <div class="w-12 h-12 rounded-full bg-emerald-500/20 border border-emerald-400 mx-auto flex items-center justify-center text-emerald-300 text-2xl font-bold">
+        ✓
+      </div>
+      <h2 class="text-2xl font-extrabold text-white">SECTOR CONTAINED!</h2>
+      <p id="level-clear-summary" class="text-sm text-slate-300"></p>
+      <button type="button" id="btn-next-level" class="w-full py-3 rounded-xl bg-gradient-to-r from-emerald-500 to-sky-500 hover:from-emerald-400 hover:to-sky-400 text-white font-bold text-sm shadow-lg transition">
+        Advance to Next Arena Wave
+      </button>
+    </div>
+  </div>
+
+  <!-- ==================== GAME OVER MODAL ==================== -->
+  <div id="modal-game-over" class="hidden fixed inset-0 z-40 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md">
+    <div class="glass-panel rounded-2xl max-w-md w-full p-6 text-center space-y-4 border-rose-500/50">
+      <div class="w-12 h-12 rounded-full bg-rose-500/20 border border-rose-400 mx-auto flex items-center justify-center text-rose-300 text-2xl font-bold">
+        ✕
+      </div>
+      <h2 class="text-2xl font-extrabold text-rose-400">CONTAINMENT BREACHED</h2>
+      <p id="game-over-summary" class="text-sm text-slate-300"></p>
+      <div class="grid grid-cols-2 gap-3 pt-2">
+        <button type="button" id="btn-restart-game" class="py-3 rounded-xl bg-gradient-to-r from-sky-500 to-emerald-500 hover:from-sky-400 hover:to-emerald-400 text-white font-bold text-sm shadow-lg transition">
+          Restart Arena
+        </button>
+        <button type="button" id="btn-gameover-lobby" class="py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-sm border border-slate-700 transition">
+          Main Lobby
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modular Game Scripts -->
+  <script src="js/config.js"></script>
+  <script src="js/audio.js"></script>
+  <script src="js/network.js"></script>
+  <script src="js/game.js"></script>
+</body>
+</html>

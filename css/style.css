@@ -1,0 +1,134 @@
+/* EntrapBall VR — Styling for Start Lobby, VR/Desktop Selector, P2P Audio HUD & Minimap */
+:root {
+  --bg-dark: #070b14;
+  --panel-bg: rgba(13, 21, 38, 0.90);
+  --border-cyan: rgba(56, 189, 248, 0.45);
+  --accent-cyan: #38bdf8;
+  --accent-emerald: #10b981;
+  --accent-amber: #f59e0b;
+  --accent-rose: #f43f5e;
+  --accent-purple: #a855f7;
+}
+
+* {
+  box-sizing: border-box;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background-color: var(--bg-dark);
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  color: #f8fafc;
+}
+
+#canvas-container {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+}
+
+#canvas-container canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Glassmorphism UI Panels */
+.glass-panel {
+  background: var(--panel-bg);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--border-cyan);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+.mode-card {
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  cursor: pointer;
+}
+
+.mode-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--accent-cyan);
+}
+
+.mode-card.active {
+  background: linear-gradient(135deg, rgba(56, 189, 248, 0.24), rgba(16, 185, 129, 0.14));
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 24px rgba(56, 189, 248, 0.35);
+}
+
+/* Crosshair & Reticle */
+#crosshair {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 15;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.reticle-ring {
+  width: 24px;
+  height: 24px;
+  border: 2px solid rgba(56, 189, 248, 0.85);
+  border-radius: 50%;
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.6);
+  transition: transform 0.1s ease, border-color 0.15s ease;
+}
+
+.reticle-dot {
+  position: absolute;
+  width: 4px;
+  height: 4px;
+  background: #10b981;
+  border-radius: 50%;
+}
+
+/* Damage & Powerup Vignettes */
+#screen-flash {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 12;
+  opacity: 0;
+  transition: opacity 0.25s ease-out;
+}
+
+/* Minimap Canvas */
+#minimap-canvas {
+  border-radius: 10px;
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  background: rgba(7, 11, 20, 0.88);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+}
+
+/* Scrollbar styling for lobby on smaller viewports */
+.custom-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.custom-scroll::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.5);
+}
+.custom-scroll::-webkit-scrollbar-thumb {
+  background: rgba(56, 189, 248, 0.4);
+  border-radius: 3px;
+}
+
+/* Touch Joystick Overlay for Mobile/Tablet testing */
+.touch-pad {
+  touch-action: none;
+}

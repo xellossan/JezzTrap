@@ -1,0 +1,186 @@
+/* Quake VR & Desktop P2P Arena - Gothic Industrial UI Styles */
+@import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Inter:wght@400;500;600;700&family=Share+Tech+Mono&display=swap');
+
+:root {
+  --q-bg-dark: #0c0907;
+  --q-bg-panel: rgba(24, 18, 14, 0.92);
+  --q-bronze: #b87333;
+  --q-amber: #f59e0b;
+  --q-gold: #fbbf24;
+  --q-crimson: #dc2626;
+  --q-blood: #7f1d1d;
+  --q-cyan: #38bdf8;
+  --q-green: #22c55e;
+  --q-text: #f3e8d6;
+  --q-muted: #a89984;
+}
+
+* {
+  box-sizing: border-box;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background-color: var(--q-bg-dark);
+  color: var(--q-text);
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+.font-quake {
+  font-family: 'Chakra Petch', sans-serif;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.font-mono-tech {
+  font-family: 'Share Tech Mono', monospace;
+}
+
+#game-canvas-container {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+  background: radial-gradient(circle at center, #1c140f 0%, #090605 100%);
+}
+
+#game-canvas-container canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Riveted Quake Metal Panel Styling */
+.quake-panel {
+  background: linear-gradient(165deg, rgba(35, 26, 20, 0.95) 0%, rgba(18, 13, 10, 0.97) 100%);
+  border: 2px solid #5c4028;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.85), inset 0 1px 0 rgba(255, 200, 140, 0.18);
+  position: relative;
+}
+
+.quake-panel::before {
+  content: '';
+  position: absolute;
+  inset: 3px;
+  border: 1px solid rgba(184, 115, 51, 0.22);
+  pointer-events: none;
+}
+
+.quake-btn {
+  background: linear-gradient(180deg, #4a3321 0%, #2b1d12 100%);
+  border: 1px solid #8a5a32;
+  color: #fde68a;
+  font-family: 'Chakra Petch', sans-serif;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  transition: all 0.15s ease;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255, 220, 160, 0.25), 0 4px 12px rgba(0, 0, 0, 0.5);
+}
+
+.quake-btn:hover:not(:disabled) {
+  background: linear-gradient(180deg, #69462b 0%, #3d2817 100%);
+  border-color: #f59e0b;
+  color: #ffffff;
+  transform: translateY(-1px);
+  box-shadow: inset 0 1px 0 rgba(255, 230, 180, 0.4), 0 0 14px rgba(245, 158, 11, 0.35);
+}
+
+.quake-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.quake-btn-primary {
+  background: linear-gradient(180deg, #991b1b 0%, #5c0f0f 100%);
+  border-color: #ef4444;
+  color: #fef2f2;
+}
+
+.quake-btn-primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #b91c1c 0%, #7f1d1d 100%);
+  border-color: #fca5a5;
+  box-shadow: 0 0 18px rgba(239, 68, 68, 0.5);
+}
+
+.mode-card {
+  background: rgba(28, 21, 16, 0.85);
+  border: 2px solid #443020;
+  transition: all 0.18s ease;
+  cursor: pointer;
+}
+
+.mode-card:hover {
+  border-color: #8a5a32;
+}
+
+.mode-card.active {
+  background: linear-gradient(180deg, rgba(180, 83, 9, 0.28) 0%, rgba(45, 26, 14, 0.92) 100%);
+  border-color: #f59e0b;
+  box-shadow: 0 0 20px rgba(245, 158, 11, 0.28), inset 0 0 12px rgba(245, 158, 11, 0.15);
+}
+
+/* Crosshair & Damage Flash */
+#crosshair {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 24px;
+  height: 24px;
+  pointer-events: none;
+  z-index: 15;
+}
+
+#damage-overlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 12;
+  opacity: 0;
+  transition: opacity 0.12s ease-out;
+}
+
+/* Weapon Bar Slot */
+.weapon-slot {
+  background: rgba(16, 12, 9, 0.82);
+  border: 1px solid #4a3525;
+  color: #a89984;
+  transition: all 0.12s ease;
+}
+
+.weapon-slot.owned {
+  color: #f3e8d6;
+  border-color: #7c5836;
+}
+
+.weapon-slot.active {
+  background: rgba(180, 83, 9, 0.45);
+  border-color: #fbbf24;
+  color: #fef08a;
+  transform: translateY(-2px);
+  box-shadow: 0 0 10px rgba(251, 191, 36, 0.4);
+}
+
+/* Custom Scrollbar for Lobby / Codex */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #120d0a;
+}
+::-webkit-scrollbar-thumb {
+  background: #5c4028;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #8a5a32;
+}
